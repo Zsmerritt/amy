@@ -875,6 +875,9 @@ void amy_reset_oscs() {
     // Reset midi_mappings.
     midi_mappings_deinit();
     midi_mappings_init();
+    // Reset the MPE zone — synths are gone, so member-channel routing to them
+    // must not survive (the sketch's knob block re-enables it if it wants it).
+    amy_mpe_reset();
     cv_trigger_deinit();
     cv_trigger_init();
     cv_from_osc_deinit();
