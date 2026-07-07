@@ -16,27 +16,6 @@ AMY responds to [MIDI pitch bend messages.](http://midi.teragonaudio.com/tech/mi
 
 AMY responds to [MIDI sustain pedal messages.](http://midi.teragonaudio.com/tech/midispec/hold.htm)
 
-## MPE (MIDI Polyphonic Expression)
-
-AMY supports MPE: notes arriving on an MPE zone's *member channels* are all played by the zone's synth, and each member channel's pitch bend, channel pressure, and CC74 (timbre) apply **per-note**, to just the voices whose notes arrived on that channel.
-
-Enable a zone by configuring the master channel's synth:
-
-```python
-amy.send(synth=1, patch=0, num_voices=10)  # the zone synth (master channel 1 = lower zone)
-amy.send(synth=1, mpe="7,48")              # 7 member channels (2-8), member bend range +/-48 semitones
-```
-
-`mpe="<num_members>[,<bend_range_semitones>]"` (wire command `iE`). `mpe="0"` turns the zone off. Master channel 16 configures an upper zone (members descend from 15). AMY also responds to the standard **MPE Configuration Message** (RPN 6 on channel 1 or 16), so DAWs and controllers that send it configure the zone automatically, and to RPN 0 (pitch bend sensitivity) on member channels to set the member bend range.
-
-Per-note expression reaches your patch through the [CtrlCoefs](synth.md) system:
-
-- **Pitch bend** on a member channel bends that note (default range ±48 semitones), via each osc's `bend` coefficient as usual.
-- **Channel pressure** (0xD0) is readable as the **`ext0`** coefficient, e.g. `amp={'vel': 1, 'ext0': 0.5}`.
-- **CC74 (timbre/slide)** is readable as the **`ext1`** coefficient, e.g. `filter_freq={'const': 800, 'ext1': 2}`.
-
-(For notes played on MPE member channels, `ext0`/`ext1` replace the CV inputs those coefficients normally read.) Sustain pedal, program change, and pitch bend on the **master** channel behave as regular zone-wide messages.
-
 ## Control changes
 
 AMY will turn off all notes when receiving an [All Notes Off control change.](http://midi.teragonaudio.com/tech/midispec/ntnoff.htm)

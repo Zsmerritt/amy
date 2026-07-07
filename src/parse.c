@@ -445,14 +445,6 @@ int amy_parse_synth_layer_message(char *message, amy_event *e) {
     char cmd = message[0];
     message++;
     if (cmd == 'd')  e->synth_delay_ms = atoi(message);
-    else if (cmd == 'E') {
-        // MPE zone config: iE<num_members>[,<bend_range_semitones>].
-        // Master channel is the event's synth; 0 members turns MPE off.
-        e->mpe_members = atoi(message);
-        const char *p = message;
-        while (*p && !isalpha((unsigned char)*p) && *p != ',') ++p;
-        if (*p == ',') e->mpe_bend_range = atoff((char *)(p + 1));
-    }
     else if (cmd == 'f')  e->synth_flags = atoi(message);
     else if (cmd == 'g')  skip_chars = cv_trigger_from_message(message, e->synth, skip_chars);
     else if (cmd == 'm')  e->grab_midi_notes = atoi(message);

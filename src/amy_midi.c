@@ -78,76 +78,10 @@ void amy_send_midi_note_off(uint16_t osc) {
     }
 }
 
-///// MPE (MIDI Polyphonic Expression)
-
-uint8_t amy_mpe_is_member_channel(uint8_t channel) {
-    mpe_state_t *mpe = &amy_global.mpe;
-    if (mpe->num_members == 0 || channel < 1 || channel > 16) return 0;
-    if (mpe->master_channel == 16)  // Upper zone: members descend from 15.
-        return (channel >= 16 - mpe->num_members) && (channel <= 15);
-    // Lower zone: members ascend from master+1.
-    return (channel >= mpe->master_channel + 1) && (channel <= mpe->master_channel + mpe->num_members);
-}
-
-// The synth that should handle a message on this channel: the zone master's
-// synth for member channels, otherwise the channel's own synth.
-uint8_t amy_mpe_synth_for_channel(uint8_t channel) {
-    if (amy_mpe_is_member_channel(channel)) return amy_global.mpe.master_channel;
-    return channel;
-}
-
-void amy_mpe_config(uint8_t master_channel, int num_members, float bend_range) {
-    mpe_state_t *mpe = &amy_global.mpe;
-    if (num_members < 0) num_members = 0;
-    if (num_members > 15) num_members = 15;
-    mpe->master_channel = (master_channel == 16) ? 16 : master_channel;
-    mpe->num_members = num_members;
-    if (AMY_IS_SET(bend_range) && bend_range > 0) mpe->member_bend_range = bend_range;
-    for (int ch = 0; ch < 17; ++ch) {
-        mpe->channel_bend[ch] = 0;
-        mpe->channel_pressure[ch] = 0;
-        mpe->channel_timbre[ch] = 0;
-    }
-    //fprintf(stderr, "MPE: master %d members %d bend range %.1f\n", mpe->master_channel, mpe->num_members, mpe->member_bend_range);
-}
-
-void amy_mpe_reset(void) {
-    mpe_state_t *mpe = &amy_global.mpe;
-    mpe->num_members = 0;
-    mpe->master_channel = 1;
-    mpe->member_bend_range = MPE_DEFAULT_MEMBER_BEND_RANGE;
-    for (int ch = 0; ch < 17; ++ch) {
-        mpe->channel_bend[ch] = 0;
-        mpe->channel_pressure[ch] = 0;
-        mpe->channel_timbre[ch] = 0;
-        mpe->rpn_msb[ch] = 0x7F;  // Null RPN.
-        mpe->rpn_lsb[ch] = 0x7F;
-    }
-}
-
 void amy_received_control_change(uint8_t channel, uint8_t control, uint8_t value, uint32_t time) {
-    mpe_state_t *mpe = &amy_global.mpe;
     if (control == 0) {
         // Bank select coarse.
         instrument_set_bank_number(channel, value);
-    } else if (control == 74 && amy_mpe_is_member_channel(channel)) {
-        // MPE per-note timbre ("slide").
-        mpe->channel_timbre[channel] = (float)value / 127.0f;
-    } else if (control == 101) {
-        mpe->rpn_msb[channel] = value;
-    } else if (control == 100) {
-        mpe->rpn_lsb[channel] = value;
-    } else if (control == 6) {
-        // Data Entry MSB for the currently-selected RPN.
-        if (mpe->rpn_msb[channel] == 0 && mpe->rpn_lsb[channel] == 6
-            && (channel == 1 || channel == 16)) {
-            // MPE Configuration Message: sets/clears the zone whose master is this channel.
-            amy_mpe_config(channel, value, AMY_UNSET_FLOAT);
-        } else if (mpe->rpn_msb[channel] == 0 && mpe->rpn_lsb[channel] == 0
-                   && amy_mpe_is_member_channel(channel)) {
-            // Pitch bend sensitivity on a member channel sets the zone's member bend range.
-            mpe->member_bend_range = (float)value;
-        }
     }
 }
 
@@ -216,27 +150,11 @@ void amy_event_midi_message_received(uint8_t * data, uint32_t len, uint8_t sysex
         uint8_t status = status_byte & 0xF0;
         uint8_t channel = status_byte & 0x0F;
         // Do the AMY instrument things here
-        // Pedal and all-notes-off on an MPE member channel act on the zone's synth.
-        if(status == 0xB0 && data[1] == 0x40) amy_received_pedal(amy_mpe_synth_for_channel(channel+1), data[2], time);
-        else if(status == 0xB0 && data[1] == 0x7B) amy_received_all_notes_off(amy_mpe_synth_for_channel(channel+1), time);
+        if(status == 0xB0 && data[1] == 0x40) amy_received_pedal(channel+1, data[2], time);
+        else if(status == 0xB0 && data[1] == 0x7B) amy_received_all_notes_off(channel+1, time);
         else if(status == 0XB0) amy_received_control_change(channel+1, data[1], data[2], time);
         else if(status == 0xC0) amy_received_program_change(channel+1, data[1], time);
-        else if(status == 0xD0) {
-            // Channel pressure: per-note pressure on MPE member channels (read as ext0).
-            if (amy_mpe_is_member_channel(channel+1))
-                amy_global.mpe.channel_pressure[channel+1] = (float)data[1] / 127.0f;
-        }
-        else if(status == 0xE0) {
-            if (amy_mpe_is_member_channel(channel+1)) {
-                // MPE per-note pitch bend: applies only to this channel's notes,
-                // scaled by the zone's bend range (semitones -> octaves).
-                int bend = (int)((data[2] << 7) | data[1]) - 8192;
-                amy_global.mpe.channel_bend[channel+1] =
-                    ((float)bend / 8192.0f) * (amy_global.mpe.member_bend_range / 12.0f);
-            } else {
-                amy_received_pitch_bend(channel+1, data[1], data[2], time);
-            }
-        }
+        else if(status == 0xE0) amy_received_pitch_bend(channel+1, data[1], data[2], time);
         // MIDI transport (Start/Stop) only drives the sequencer when the user
         // has opted into external sync; otherwise a connected DAW's transport
         // would hijack the AMYboard's own internal sequence.

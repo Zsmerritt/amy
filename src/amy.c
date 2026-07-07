@@ -442,9 +442,8 @@ int8_t global_init(amy_config_t c) {
         amy_global.volume[bus] = 1.0f;
     amy_global.pitch_bend = 0;
     amy_global.latency_ms = 0;
-    amy_global.tempo = 108.0;
+    amy_global.tempo = 108.0; 
     amy_global.pitch_bend = 0;
-    amy_mpe_reset();
     amy_global.transfer_flag = AMY_TRANSFER_TYPE_NONE;
     amy_global.transfer_storage = NULL;
     amy_global.transfer_length_bytes = 0;
@@ -1558,16 +1557,6 @@ void hold_and_modify(uint16_t osc) {
     ctrl_inputs[COEF_BEND] = amy_global.pitch_bend;
     ctrl_inputs[COEF_EXT0] = cv_inputs[0];
     ctrl_inputs[COEF_EXT1] = cv_inputs[1];
-    // MPE: notes that arrived on an MPE member channel get that channel's
-    // per-note expression instead of the global bend / CV inputs.
-    {
-        uint8_t nsc = synth[osc]->note_source_channel;
-        if (AMY_IS_SET(synth[osc]->note_source_channel) && amy_mpe_is_member_channel(nsc)) {
-            ctrl_inputs[COEF_BEND] = amy_global.mpe.channel_bend[nsc];
-            ctrl_inputs[COEF_EXT0] = amy_global.mpe.channel_pressure[nsc];
-            ctrl_inputs[COEF_EXT1] = amy_global.mpe.channel_timbre[nsc];
-        }
-    }
 
     msynth[osc]->last_pan = msynth[osc]->pan;
 
