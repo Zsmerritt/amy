@@ -159,6 +159,7 @@ _KW_MAP_LIST = [   # Order matters because patch_string must come last.
     ('external_midi_sync', 'zCI'),
     ('synth', 'iI'), ('pedal', 'ipI'), ('synth_flags', 'ifI'), ('num_voices', 'ivI'), ('oscs_per_voice', 'inI'),
     ('to_synth', 'itI'), ('grab_midi_notes', 'imI'),  ('note_source_channel', 'iMI'), ('synth_delay', 'idI'),
+    ('mpe', 'iEL'),  # MPE zone config: "num_members[,bend_range_semitones]", master channel = synth
     ('preset', 'pI'), ('num_partials', 'pI'), # note aliasing
     ('start_sample', 'zSL'), ('stop_sample', 'zOI'),
     ('bus', 'yI'),
