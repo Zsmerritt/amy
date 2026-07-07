@@ -333,7 +333,9 @@ enum coefs{
 // to the master channel's synth, and each member channel's pitch bend (0xE0),
 // channel pressure (0xD0), and CC74 (timbre) apply per-note to the voices whose
 // notes arrived on that channel (via each osc's note_source_channel).
-#define MPE_DEFAULT_MEMBER_BEND_RANGE 48.0f  // semitones, per MPE spec default
+// Default MPE member-channel pitch bend range in semitones, per the MPE spec.
+// (No 'f' suffix or trailing comment: this line is scraped into amy/constants.py.)
+#define MPE_DEFAULT_MEMBER_BEND_RANGE 48.0
 typedef struct mpe_state {
     uint8_t num_members;      // 0 = MPE off.  1-15 member channels.
     uint8_t master_channel;   // 1 (lower zone) or 16 (upper zone).
