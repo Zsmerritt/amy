@@ -646,7 +646,16 @@ void amy_event_to_deltas_queue(amy_event *e, uint16_t base_osc, struct delta **q
     EVENT_TO_DELTA_WITH_BASEOSC(chained_osc, CHAINED_OSC)
     EVENT_TO_DELTA_WITH_BASEOSC(reset_osc, RESET_OSC)
     EVENT_TO_DELTA_WITH_BASEOSC(mod_source, MOD_SOURCE)
-    EVENT_TO_DELTA_I(note_source_channel, NOTE_SOURCE_CHANNEL)
+    // For note on/off, always stamp the source channel — including the "unset"
+    // value for non-MIDI notes. A voice previously played by an MPE member
+    // channel would otherwise keep its stale channel and apply that channel's
+    // per-note bend/pressure/timbre to a note sent from a sketch or the web
+    // keyboard.
+    if (AMY_IS_SET(e->velocity)) {
+        d.param = NOTE_SOURCE_CHANNEL; d.data.i = e->note_source_channel; add_delta_to_queue(&d, queue);
+    } else {
+        EVENT_TO_DELTA_I(note_source_channel, NOTE_SOURCE_CHANNEL)
+    }
     EVENT_TO_DELTA_I(filter_type, FILTER_TYPE)
     EVENT_TO_DELTA_I(algorithm, ALGORITHM)
     EVENT_TO_DELTA_F(eq_l, EQ_L)
