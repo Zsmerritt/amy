@@ -238,12 +238,20 @@ void midi_msg_handler(uint8_t * bytes, uint16_t len, uint8_t is_sysex, uint32_t 
     //fprintf(stderr, "time %.3f midi_msg_handler: 0x%x 0x%x 0x%x\n", amy_global.time, bytes[0], bytes[1], bytes[2]);
     uint8_t status = bytes[0] & 0xF0;
     uint8_t channel = (bytes[0] & 0x0F) + 1;
+    // Notes on MPE member channels are played by the zone master's synth, but
+    // keep the member channel in note_source_channel (iM) so per-note
+    // expression can find the right voices at render time.  CCs are not
+    // redirected; MPE member-channel CCs are per-note controllers (CC74 is
+    // handled in amy_received_control_change).
+    uint8_t synth_channel = channel;
+    if ((status == 0x90 || status == 0x80) && amy_mpe_is_member_channel(channel))
+        synth_channel = amy_global.mpe.master_channel;
     if (status == 0xB0
-        || ((!instrument_number_exists(channel, NULL) || instrument_grab_midi_notes(channel))
+        || ((!instrument_number_exists(synth_channel, NULL) || instrument_grab_midi_notes(synth_channel))
             && (status == 0x90 || status == 0x80))) {  // CC or note-on with grab_midi set.
         int type = (status == 0xB0) ? MIDI_MAP_TYPE_CC : MIDI_MAP_TYPE_NOTE;
         int code = bytes[1];  // note for note-on events
-        struct midi_mapping **p_mapping = midi_mapping_find(channel, type, code);
+        struct midi_mapping **p_mapping = midi_mapping_find(synth_channel, type, code);
         struct midi_mapping *mapping = &default_note_mapping;
         if (type == MIDI_MAP_TYPE_NOTE || p_mapping != NULL) {
             if (p_mapping != NULL)
@@ -261,7 +269,7 @@ void midi_msg_handler(uint8_t * bytes, uint16_t len, uint8_t is_sysex, uint32_t 
                 sprintf(message + offset, "t%" PRId32, time);
                 offset = strlen(message);
             }
-            substitute_midi_special_values(message + offset, mapping->message_template, channel, code, value);
+            substitute_midi_special_values(message + offset, mapping->message_template, synth_channel, code, value);
             amy_add_message(message);
         }
     }

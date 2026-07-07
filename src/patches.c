@@ -381,6 +381,7 @@ bool event_addresses_oscs(amy_event *e, bool *p_is_empty) {
     _RET_TRUE_IF_SET(synth_delay_ms);  // Extra delay added to synth note-ons to allow decay on voice-stealing.
     _RET_TRUE_IF_SET(to_synth);  // For moving setup between synth numbers.
     _RET_TRUE_IF_SET(grab_midi_notes);  // To enable/disable automatic MIDI note-on/off generating note-on/off.
+    _RET_TRUE_IF_SET(mpe_members);  // MPE zone configuration.
     _RET_TRUE_IF_SET(note_source_channel);  // Marks synth as MIDI-driven, so note-on events aren't echo'd to output MIDI.
     _RET_TRUE_IF_SET(pedal);  // MIDI pedal value.
     _RET_TRUE_IF_SET(num_voices);
@@ -828,6 +829,10 @@ uint8_t patches_voices_for_note_onoff_event(amy_event *e, uint16_t voices[], uin
             // This event includes a note *and* a preset, so it's like a drum sample note on.
             // Wrap the preset number into the note, so we don't allocate the same pitch for different drums to the same voice.
             note += 128 * e->preset;
+        } else if (AMY_IS_SET(e->note_source_channel) && amy_mpe_is_member_channel(e->note_source_channel)) {
+            // MPE allows the same note number to sound on different member channels;
+            // wrap the channel into the note key so each gets its own voice.
+            note += 128 * e->note_source_channel;
         }
         bool is_note_off = (e->velocity == 0);
         voices[0] = instrument_voice_for_note_event(e->synth, note, is_note_off, pstolen);
@@ -875,6 +880,11 @@ uint8_t patches_voices_for_event(amy_event *e, uint16_t voices[]) {
         if (AMY_IS_SET(e->grab_midi_notes)) {
             // Set the grab_midi state.
             instrument_set_grab_midi_notes(e->synth, e->grab_midi_notes);
+        }
+        if (AMY_IS_SET(e->mpe_members)) {
+            // Configure the MPE zone whose master channel is this synth.
+            amy_mpe_config(e->synth, e->mpe_members,
+                           AMY_IS_SET(e->mpe_bend_range) ? e->mpe_bend_range : AMY_UNSET_FLOAT);
         }
         if (AMY_IS_SET(e->pedal)) {
             // Pedal events are a special case
@@ -960,7 +970,7 @@ void patches_event_has_voices(amy_event *e, struct delta **queue) {
     // Set the bus for the instrument, but also for each osc of each voice, below.
     if (AMY_IS_SET(e->bus)) instrument_set_bus(instrument, e->bus);
     // Should we invoke MIDI note-on cmd rules?
-    if (AMY_IS_SET(e->velocity) && AMY_IS_SET(e->midi_note) && (synth_flags & SYNTH_FLAGS_NOTES_VIA_MIDI) && (e->note_source_channel != synth)) {
+    if (AMY_IS_SET(e->velocity) && AMY_IS_SET(e->midi_note) && (synth_flags & SYNTH_FLAGS_NOTES_VIA_MIDI) && (amy_mpe_synth_for_channel(e->note_source_channel) != synth)) {
         // Route note-on event via MIDI to invoke midi_note_cmds
         uint8_t bytes[3];
         bytes[0] = 0x90 + (0x0F & (instrument - 1));
