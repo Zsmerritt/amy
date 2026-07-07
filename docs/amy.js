@@ -212,6 +212,7 @@ var AMY_KW_MAP = {
   grab_midi_notes: {wire: "im", type: "I"},
   note_source_channel: {wire: "iM", type: "I"},
   synth_delay: {wire: "id", type: "I"},
+  mpe: {wire: "iE", type: "L"},
   preset: {wire: "p", type: "I"},
   num_partials: {wire: "p", type: "I"},
   start_sample: {wire: "zS", type: "L"},
@@ -279,15 +280,16 @@ var AMY_KW_PRIORITY = {
   grab_midi_notes: 52,
   note_source_channel: 53,
   synth_delay: 54,
-  preset: 55,
-  num_partials: 56,
-  start_sample: 57,
-  stop_sample: 58,
-  bus: 59,
-  midi_cc: 60,
-  midi_note_cmd: 61,
-  cv_trigger: 62,
-  patch_string: 63
+  mpe: 55,
+  preset: 56,
+  num_partials: 57,
+  start_sample: 58,
+  stop_sample: 59,
+  bus: 60,
+  midi_cc: 61,
+  midi_note_cmd: 62,
+  cv_trigger: 63,
+  patch_string: 64
 };
 
 var AMY_COEF_FIELDS = ["const", "note", "vel", "eg0", "eg1", "mod", "bend", "ext0", "ext1"];
@@ -539,6 +541,7 @@ var AMY = {
   SYNTH_FLAGS_NOTES_VIA_MIDI: 1,
   SYNTH_FLAGS_IGNORE_NOTE_OFFS: 2,
   SYNTH_FLAGS_NEGATE_PEDAL: 4,
+  MPE_DEFAULT_MEMBER_BEND_RANGE: 48.0,
   AMY_OK: 0,
   AMY_AUDIO_IS_NONE: 0,
   AMY_AUDIO_IS_I2S: 1,
