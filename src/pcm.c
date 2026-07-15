@@ -53,8 +53,10 @@ void amy_set_gamma9001_pcm(const int16_t * data) {
 
 #ifdef GM_FONTS
 #include "pcm_gm.h"
+#include "pcm_gm_big.h"
 // Set by the platform at boot: ESP32-S3 passes the esp_partition_mmap'd
-// `fonts` partition. NULL = GM presets unavailable.
+// `fonts` partition (GeneralUser bank at 0, big multi-font bank at 0x300000;
+// both maps' offsets are partition-relative). NULL = GM presets unavailable.
 const int16_t * gm_pcm = NULL;
 void amy_set_gm_pcm(const int16_t * data) {
     gm_pcm = data;
@@ -113,6 +115,24 @@ memorypcm_preset_t * get_preset_for_preset_number(uint16_t preset_number,
         rom_local->midinote = g->midinote;
         rom_local->samplerate = GM_SAMPLE_RATE;
         rom_local->log2sr = log2f((float)GM_SAMPLE_RATE / ZERO_LOGFREQ_IN_HZ);
+        rom_local->type = AMY_PCM_TYPE_GAMMA;
+        rom_local->channels = 1;
+        return rom_local;
+    }
+
+    // Big multi-font bank presets live at GM_BIG_PRESET_BASE+, same partition.
+    if (preset_number >= GM_BIG_PRESET_BASE &&
+        preset_number < GM_BIG_PRESET_BASE + GM_BIG_NUM_SAMPLES &&
+        gm_pcm != NULL && rom_local != NULL) {
+        const pcm_map_t *g = &gm_big_map[preset_number - GM_BIG_PRESET_BASE];
+        memset(rom_local, 0, sizeof(*rom_local));
+        rom_local->sample_ram = (int16_t *)gm_pcm + g->offset;
+        rom_local->length = g->length;
+        rom_local->loopstart = g->loopstart;
+        rom_local->loopend = g->loopend;
+        rom_local->midinote = g->midinote;
+        rom_local->samplerate = GM_BIG_SAMPLE_RATE;
+        rom_local->log2sr = log2f((float)GM_BIG_SAMPLE_RATE / ZERO_LOGFREQ_IN_HZ);
         rom_local->type = AMY_PCM_TYPE_GAMMA;
         rom_local->channels = 1;
         return rom_local;
