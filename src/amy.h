@@ -110,6 +110,7 @@ extern const uint32_t pcm_wavetable_len;
 extern const int16_t * gamma9001_pcm;
 extern void amy_set_gamma9001_pcm(const int16_t * data);
 extern void amy_set_gm_pcm(const int16_t * data);
+extern void amy_set_gm_big_pcm(const int16_t * data);
 
 // Oscs below this floor are never auto-allocated to patch voices -- for hosts
 // that drive low-numbered oscs directly alongside the patch/instrument layer.

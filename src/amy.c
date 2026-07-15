@@ -366,6 +366,9 @@ void dealloc_reverb_delay_lines(uint8_t bus) {
 }
 
 void config_reverb(uint8_t bus, float level, float liveness, float damping, float xover_hz) {
+#ifdef AMY_MASTER_REVERB
+    bus = 0;   // one shared room: reverb config always lands on the master slot
+#endif
     if (AMY_IS_UNSET(level)) level = S2F(amy_global.bus[bus]->reverb.level);
     if (AMY_IS_UNSET(liveness)) liveness = amy_global.bus[bus]->reverb.liveness;
     if (AMY_IS_UNSET(damping)) damping = amy_global.bus[bus]->reverb.damping;
@@ -1997,6 +2000,7 @@ int16_t * amy_fill_buffer() {
                 }
             }
         }
+#ifndef AMY_MASTER_REVERB
         if(AMY_HAS_REVERB) {
             // apply per-bus reverb.
             if(amy_global.bus[bus]->reverb.level > 0 && amy_global.bus[bus]->reverb.rev != NULL && amy_global.bus[bus]->reverb.rev->delay_1 != NULL) {
@@ -2007,16 +2011,51 @@ int16_t * amy_fill_buffer() {
                 }
             }
         }
+#endif  // !AMY_MASTER_REVERB
     }  // end of per-bus FX
     // global volume is supposed to max out at 10, so scale by 0.1.
     SAMPLE volume_scale[AMY_NUM_BUSES];
     for (int bus = 0; bus <= amy_global.highest_bus; ++bus)
         volume_scale[bus] = MUL4_SS(F2S(0.1f), F2S(amy_global.volume[bus]));
+    int sum_hi = amy_global.highest_bus;
+#ifdef AMY_MASTER_REVERB
+    // Master "room" reverb (deck policy): buses are per-instrument INSERT
+    // chains (chorus/EQ/echo), but reverb is one shared room. Fold the
+    // post-fader buses into bus 0's block, run bus 0's reverb ONCE on the
+    // sum, and let the output stage read only that. Costs one reverb total
+    // instead of one per instrument. (The per-bus reverb apply above is
+    // compiled out under this flag.)
+    if (AMY_HAS_REVERB && amy_global.bus[0]->reverb.level > 0
+            && amy_global.bus[0]->reverb.rev != NULL
+            && amy_global.bus[0]->reverb.rev->delay_1 != NULL) {
+        for (int16_t c = 0; c < AMY_NCHANS; ++c) {
+            for (int16_t i = 0; i < AMY_BLOCK_SIZE; ++i) {
+                int idx = i + c * AMY_BLOCK_SIZE;
+                SAMPLE s = 0;
+                for (int bus = 0; bus <= amy_global.highest_bus; ++bus)
+                    s += MUL8_SS(volume_scale[bus], fbl[0][bus][idx]);
+                fbl[0][0][idx] = s;
+            }
+        }
+        if (AMY_NCHANS == 1) {
+            stereo_reverb(amy_global.bus[0]->reverb.rev, fbl[0][0], NULL,
+                          fbl[0][0], NULL, AMY_BLOCK_SIZE,
+                          amy_global.bus[0]->reverb.level);
+        } else {
+            stereo_reverb(amy_global.bus[0]->reverb.rev, fbl[0][0],
+                          fbl[0][0] + AMY_BLOCK_SIZE, fbl[0][0],
+                          fbl[0][0] + AMY_BLOCK_SIZE, AMY_BLOCK_SIZE,
+                          amy_global.bus[0]->reverb.level);
+        }
+        sum_hi = 0;                     // output reads the folded master only
+        volume_scale[0] = F2S(1.0f);    // gain already applied in the fold
+    }
+#endif
     for(int16_t i=0; i < AMY_BLOCK_SIZE; ++i) {
         for (int16_t c=0; c < AMY_NCHANS; ++c) {
 
             SAMPLE fsample = 0;
-            for (int bus = 0; bus <= amy_global.highest_bus; ++bus) {
+            for (int bus = 0; bus <= sum_hi; ++bus) {
                 // Convert the mixed sample into the int16 range, applying overall gain.
                 fsample += MUL8_SS(volume_scale[bus], fbl[0][bus][i + c * AMY_BLOCK_SIZE]);
             }
