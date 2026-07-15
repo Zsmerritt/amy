@@ -204,8 +204,13 @@ void algo_init() {
 
 }
 
+#define NUM_ALGORITHMS (sizeof(algorithms) / sizeof(algorithms[0]))
+
 SAMPLE render_algo(SAMPLE* buf, uint16_t osc, uint8_t core) {
-    struct FmAlgorithm algo = algorithms[synth[osc]->algorithm];
+    // algorithm arrives unchecked from the wire; clamp to keep the table read in bounds.
+    uint8_t algorithm = synth[osc]->algorithm;
+    if (algorithm >= NUM_ALGORITHMS) algorithm = 0;
+    struct FmAlgorithm algo = algorithms[algorithm];
     SAMPLE max_value = 0;
 
     // starts at op 6
