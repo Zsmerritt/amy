@@ -1057,6 +1057,8 @@ extern void midi_msg_handler(uint8_t * bytes, uint16_t len, uint8_t is_sysex_unu
 extern void midi_message_handler_to_queue(uint8_t * bytes, uint16_t len, uint32_t time, amy_event *base_event, struct delta **queue);
 // Generator function for midi_message_handler.  Returns series of modified events while state is returned non-NULL.
 extern void *yield_midi_message_handler_events(uint8_t * bytes, uint16_t len, uint32_t time, amy_event *event, void *state);
+// Output peak (0..1) since the last call -- UI level meters. Reading resets it.
+extern float amy_get_level(void);
 
 extern float cv_inputs[AMY_MAX_CV_IN];
 #ifdef __EMSCRIPTEN__

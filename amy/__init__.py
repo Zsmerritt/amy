@@ -16,10 +16,12 @@ try:
     _render_load = _amy.render_load
     _set_render_load_threshold = _amy.set_render_load_threshold
     _dump_state = _amy.dump_state
+    _get_level = _amy.get_level
 except (ImportError, AttributeError):
     # C module is not required? not available?
     # I'm guessing this might mean we're on Micropython?
     _set_cv_from_osc = lambda c, o: None
+    _get_level = lambda: 0.0
     try:
         import tulip
         _get_synth_commands = tulip.amy_get_synth_commands
@@ -27,6 +29,7 @@ except (ImportError, AttributeError):
         _render_load = tulip.amy_render_load
         _set_render_load_threshold = tulip.amy_set_render_load_threshold
         _dump_state = tulip.amy_dump_state
+        _get_level = tulip.amy_get_level
     except (ImportError, AttributeError):
         pass  # Not available (e.g. web build); _get_synth_commands returns []
 
@@ -606,3 +609,7 @@ def render_load():
 
 def set_render_load_threshold(t):
     _set_render_load_threshold(t)
+
+# Output peak level (0..1) since the last call, for UI level meters. Reading resets it.
+def get_level():
+    return _get_level()

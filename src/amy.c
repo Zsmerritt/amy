@@ -1971,6 +1971,19 @@ void amy_block_processed(void) {
 #endif
 }
 
+// Output peak-hold for UI level meters: max |sample| since the last
+// amy_get_level() call. Written on the audio task, read+reset by the UI task
+// -- single-word ops, same discipline as amy_global.pitch_bend; a write lost
+// between read and reset only softens one meter frame.
+static volatile int32_t amy_peak_hold = 0;
+
+float amy_get_level(void) {
+    int32_t p = amy_peak_hold;
+    amy_peak_hold = 0;
+    if (p > SAMPLE_MAX) p = SAMPLE_MAX;
+    return (float)p / (float)SAMPLE_MAX;
+}
+
 int16_t * amy_fill_buffer() {
     AMY_PROFILE_START(AMY_FILL_BUFFER)
     #ifdef __EMSCRIPTEN__
@@ -2090,6 +2103,9 @@ int16_t * amy_fill_buffer() {
                     uintval = clipping_lookup_table[uintval - FIRST_NONLIN];
                 }
             }
+            // meter tap: |sample| is already in hand here (see amy_get_level);
+            // tracked pre-platform-shift so the scale is SAMPLE_MAX everywhere
+            if (uintval > amy_peak_hold) amy_peak_hold = uintval;
             int16_t sample;
 
             // TODO -- the esp stuff here could sit outside of AMY

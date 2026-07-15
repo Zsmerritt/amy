@@ -308,6 +308,10 @@ static PyObject *amy_get_render_load_wrapper(PyObject *self, PyObject *args) {
     return Py_BuildValue("f", amy_get_render_load());
 }
 
+static PyObject *amy_get_level_wrapper(PyObject *self, PyObject *args) {
+    return Py_BuildValue("f", amy_get_level());
+}
+
 static PyObject *amy_set_render_load_threshold_wrapper(PyObject *self, PyObject *args) {
     if (!(PyTuple_Size(args) == 1)) return NULL;
     float threshold;
@@ -331,6 +335,7 @@ static PyMethodDef c_amyMethods[] = {
     {"set_cv_from_osc", set_cv_from_osc_wrapper, METH_VARARGS, "Feed external CV input from a mod osc"},
     {"ticks_ms", amy_ticks_ms_wrapper, METH_VARARGS, "Read AMY millisecond clock"},
     {"render_load", amy_get_render_load_wrapper, METH_VARARGS, "Read current render load fraction"},
+    {"get_level", amy_get_level_wrapper, METH_VARARGS, "Read output peak level (0..1) since last call; reading resets it"},
     {"set_render_load_threshold", amy_set_render_load_threshold_wrapper, METH_VARARGS, "Set the fraction of CPU at which to trigger overload failsafe"},
     { NULL, NULL, 0, NULL }
 };
