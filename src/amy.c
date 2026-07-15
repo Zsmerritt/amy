@@ -441,6 +441,7 @@ void bus_reset(uint8_t bus) {
     reset_parametric(bus);
 
     if (AMY_HAS_CHORUS) config_chorus(bus, CHORUS_DEFAULT_LEVEL, CHORUS_DEFAULT_MAX_DELAY, CHORUS_DEFAULT_LFO_FREQ, CHORUS_DEFAULT_MOD_DEPTH);
+    amy_global.bus[bus]->reverb_send = 1.0f;  // aux-send spike: 1.0 == master-room behavior
     if (AMY_HAS_REVERB) config_reverb(bus, REVERB_DEFAULT_LEVEL, REVERB_DEFAULT_LIVENESS, REVERB_DEFAULT_DAMPING, REVERB_DEFAULT_XOVER_HZ);
     if (AMY_HAS_ECHO)   config_echo(bus, S2F(ECHO_DEFAULT_LEVEL), ECHO_DEFAULT_DELAY_MS, ECHO_DEFAULT_MAX_DELAY_MS, S2F(ECHO_DEFAULT_FEEDBACK), S2F(ECHO_DEFAULT_FILTER_COEF));
 }
@@ -602,7 +603,8 @@ void amy_event_to_deltas_queue(amy_event *e, uint16_t base_osc, struct delta **q
     if (AMY_IS_SET(e->eq_l) || AMY_IS_SET(e->eq_m) || AMY_IS_SET(e->eq_h)
         || AMY_IS_SET(e->echo_level) || AMY_IS_SET(e->echo_delay_ms) || AMY_IS_SET(e->echo_max_delay_ms) || AMY_IS_SET(e->echo_feedback) || AMY_IS_SET(e->echo_filter_coef)
         || AMY_IS_SET(e->chorus_level) || AMY_IS_SET(e->chorus_max_delay) || AMY_IS_SET(e->chorus_lfo_freq) || AMY_IS_SET(e->chorus_depth) 
-        || AMY_IS_SET(e->reverb_level) || AMY_IS_SET(e->reverb_liveness) || AMY_IS_SET(e->reverb_damping) || AMY_IS_SET(e->reverb_xover_hz)) {
+        || AMY_IS_SET(e->reverb_level) || AMY_IS_SET(e->reverb_liveness) || AMY_IS_SET(e->reverb_damping) || AMY_IS_SET(e->reverb_xover_hz)
+        || AMY_IS_SET(e->reverb_send)) {
         if (AMY_IS_SET(e->osc))  fprintf(stderr, "** osc %d specific for bus-directed command, ignoring\n", e->osc);  // Can't at this moment be more specific about which command.
         // Store the target bus in d.osc.
         d.osc = AMY_IS_SET(e->bus) ? e->bus : AMY_DEFAULT_BUS;
@@ -692,6 +694,7 @@ void amy_event_to_deltas_queue(amy_event *e, uint16_t base_osc, struct delta **q
     EVENT_TO_DELTA_F(chorus_lfo_freq, CHORUS_LFO_FREQ)
     EVENT_TO_DELTA_F(chorus_depth, CHORUS_DEPTH)
     EVENT_TO_DELTA_F(reverb_level, REVERB_LEVEL)
+    EVENT_TO_DELTA_F(reverb_send, REVERB_SEND)
     EVENT_TO_DELTA_F(reverb_liveness, REVERB_LIVENESS)
     EVENT_TO_DELTA_F(reverb_damping, REVERB_DAMPING)
     EVENT_TO_DELTA_F(reverb_xover_hz, REVERB_XOVER_HZ)
@@ -1446,6 +1449,7 @@ void play_delta(struct delta *d) {
     if(d->param == CHORUS_LFO_FREQ) config_chorus(bus, AMY_UNSET_FLOAT, UINT16_MAX, d->data.f, AMY_UNSET_FLOAT);
     if(d->param == CHORUS_DEPTH) config_chorus(bus, AMY_UNSET_FLOAT, UINT16_MAX, AMY_UNSET_FLOAT, d->data.f);
     if(d->param == REVERB_LEVEL) config_reverb(bus, d->data.f, AMY_UNSET_FLOAT, AMY_UNSET_FLOAT, AMY_UNSET_FLOAT);
+    if(d->param == REVERB_SEND) amy_global.bus[bus]->reverb_send = d->data.f;  // aux-send spike
     if(d->param == REVERB_LIVENESS) config_reverb(bus, AMY_UNSET_FLOAT, d->data.f, AMY_UNSET_FLOAT, AMY_UNSET_FLOAT);
     if(d->param == REVERB_DAMPING) config_reverb(bus, AMY_UNSET_FLOAT, AMY_UNSET_FLOAT, d->data.f, AMY_UNSET_FLOAT);
     if(d->param == REVERB_XOVER_HZ) config_reverb(bus, AMY_UNSET_FLOAT, AMY_UNSET_FLOAT, AMY_UNSET_FLOAT, d->data.f);
@@ -2018,6 +2022,51 @@ int16_t * amy_fill_buffer() {
     for (int bus = 0; bus <= amy_global.highest_bus; ++bus)
         volume_scale[bus] = MUL4_SS(F2S(0.1f), F2S(amy_global.volume[bus]));
     int sum_hi = amy_global.highest_bus;
+#ifdef AMY_AUX_REVERB
+    // AUX-SEND SPIKE (docs/AUX-SENDS.md): like AMY_MASTER_REVERB, but each
+    // bus feeds the shared room through its own post-fader SEND level.
+    // send=1.0 everywhere reproduces master-room behavior exactly.
+    if (AMY_HAS_REVERB && amy_global.bus[0]->reverb.level > 0
+            && amy_global.bus[0]->reverb.rev != NULL
+            && amy_global.bus[0]->reverb.rev->delay_1 != NULL) {
+        static SAMPLE aux[AMY_BLOCK_SIZE * AMY_NCHANS];
+        static SAMPLE auxdry[AMY_BLOCK_SIZE * AMY_NCHANS];
+        SAMPLE send_scale[AMY_NUM_BUSES];
+        for (int bus = 0; bus <= amy_global.highest_bus; ++bus)
+            send_scale[bus] = MUL8_SS(volume_scale[bus],
+                                      F2S(amy_global.bus[bus]->reverb_send));
+        for (int16_t c = 0; c < AMY_NCHANS; ++c) {
+            for (int16_t i = 0; i < AMY_BLOCK_SIZE; ++i) {
+                int idx = i + c * AMY_BLOCK_SIZE;
+                SAMPLE dry = 0, snd = 0;
+                for (int bus = 0; bus <= amy_global.highest_bus; ++bus) {
+                    SAMPLE v = fbl[0][bus][idx];
+                    dry += MUL8_SS(volume_scale[bus], v);
+                    snd += MUL8_SS(send_scale[bus], v);
+                }
+                fbl[0][0][idx] = dry;
+                aux[idx] = snd;
+                auxdry[idx] = snd;
+            }
+        }
+        // Spike shortcut: stereo_reverb() writes in + level*wet; run it on the
+        // aux buffer in place and add (out - in) = level*wet to the master.
+        // The production version adds a wet-only stereo_reverb variant in
+        // delay.c to drop the auxdry copy + subtract pass.
+        if (AMY_NCHANS == 1) {
+            stereo_reverb(amy_global.bus[0]->reverb.rev, aux, NULL, aux, NULL,
+                          AMY_BLOCK_SIZE, amy_global.bus[0]->reverb.level);
+        } else {
+            stereo_reverb(amy_global.bus[0]->reverb.rev, aux,
+                          aux + AMY_BLOCK_SIZE, aux, aux + AMY_BLOCK_SIZE,
+                          AMY_BLOCK_SIZE, amy_global.bus[0]->reverb.level);
+        }
+        for (int idx = 0; idx < AMY_BLOCK_SIZE * AMY_NCHANS; ++idx)
+            fbl[0][0][idx] += aux[idx] - auxdry[idx];
+        sum_hi = 0;
+        volume_scale[0] = F2S(1.0f);
+    }
+#endif  // AMY_AUX_REVERB
 #ifdef AMY_MASTER_REVERB
     // Master "room" reverb (deck policy): buses are per-instrument INSERT
     // chains (chorus/EQ/echo), but reverb is one shared room. Fold the

@@ -763,7 +763,7 @@ int amy_parse_message(char * message, amy_event *e) {
             case 'O': parse_algo_source(arg, e->algo_source); break;
             case 'p': e->preset=atoi(arg); break;
             case 'P': e->trigger_phase=atoff(arg); break;
-            /* q unused */
+            case 'q': e->reverb_send = atoff(arg); break;  // aux-send spike
             case 'Q': parse_coef_message(arg, e->pan_coefs); break;
             case 'r': parse_voices(arg, e->voices); break;
             case 'R': e->resonance=atoff(arg); break;

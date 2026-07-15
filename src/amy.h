@@ -403,6 +403,7 @@ enum params{
     VOLUME_BASE,                         // 70..73
     VOLUME_END=VOLUME_BASE + AMY_NUM_BUSES, // 74
     SYNC_SOURCE, MOD1_SOURCE,            // 75, 76
+    REVERB_SEND,                         // 77 (aux-send spike)
     ALGO_SOURCE_START=100,               // 100..105
     ALGO_SOURCE_END=100+MAX_ALGO_OPS,    // 106
     BP_START=ALGO_SOURCE_END + 1,        // 107..202
@@ -570,6 +571,7 @@ typedef struct amy_event {
     float eq_l;  // not in synth
     float eq_m;  // not in synth
     float eq_h;  // not in synth
+    float reverb_send;  // aux-send spike: per-bus send into the shared room
     uint16_t bp_is_set[MAX_BREAKPOINT_SETS];
     // Convert these two at least to vectors of ints, save several hundred bytes
     int16_t algo_source[MAX_ALGO_OPS];
@@ -848,6 +850,9 @@ typedef struct bus_state {
     // State of fixed dc-blocking HPF
     eq_state_t eq;
     reverb_state_t reverb;
+    // AUX-SEND SPIKE: how much of this bus's post-fader signal feeds the
+    // shared reverb return (1.0 default = today's master-room behavior).
+    float reverb_send;
     chorus_config_t chorus;
     echo_config_t echo;
 } bus_state_t;
