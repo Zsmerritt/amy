@@ -1020,6 +1020,8 @@ extern uint8_t amy_mpe_is_member_channel(uint8_t channel);
 extern uint8_t amy_mpe_synth_for_channel(uint8_t channel);
 extern void amy_mpe_config(uint8_t master_channel, int num_members, float bend_range);
 extern void amy_mpe_reset(void);
+// Output peak (0..1) since the last call -- UI level meters. Reading resets it.
+extern float amy_get_level(void);
 
 extern float cv_inputs[AMY_MAX_CV_IN];
 #ifdef __EMSCRIPTEN__
