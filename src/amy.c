@@ -662,6 +662,8 @@ void amy_event_to_deltas_queue(amy_event *e, uint16_t base_osc, struct delta **q
     EVENT_TO_DELTA_WITH_BASEOSC(chained_osc, CHAINED_OSC)
     EVENT_TO_DELTA_WITH_BASEOSC(reset_osc, RESET_OSC)
     EVENT_TO_DELTA_WITH_BASEOSC(mod_source, MOD_SOURCE)
+    EVENT_TO_DELTA_WITH_BASEOSC(mod1_source, MOD1_SOURCE)
+    EVENT_TO_DELTA_WITH_BASEOSC(sync_source, SYNC_SOURCE)
     // For note on/off, always stamp the source channel — including the "unset"
     // value for non-MIDI notes. A voice previously played by an MPE member
     // channel would otherwise keep its stale channel and apply that channel's
@@ -817,6 +819,8 @@ void reset_osc_params(struct synthinfo *psynth) {
     psynth->filter_type = FILTER_NONE;
     AMY_UNSET(psynth->chained_osc);
     AMY_UNSET(psynth->mod_source);
+    AMY_UNSET(psynth->mod1_source);
+    AMY_UNSET(psynth->sync_source);
     psynth->algorithm = 0;
     for(uint8_t j=0;j<MAX_ALGO_OPS;j++) AMY_UNSET(psynth->algo_source[j]);
     for(uint8_t j=0;j<MAX_BREAKPOINT_SETS;j++) {
@@ -1239,6 +1243,26 @@ uint16_t alpha_to_portamento_ms(float alpha) {
     return (int)roundf(1000.0f * AMY_BLOCK_SIZE / AMY_SAMPLE_RATE / (1.0f - alpha)) - 1;
 }
 
+// Restart a modulation oscillator at note-on (shared by mod_source and mod1_source).
+static void trigger_mod_osc(uint16_t mod_osc) {
+    if (AMY_IS_SET(synth[mod_osc]->trigger_phase))
+        synth[mod_osc]->phase = F2P(synth[mod_osc]->trigger_phase);
+    synth[mod_osc]->note_on_clock = amy_global.total_samples;  // Need a note_on_clock to have envelope work correctly.
+    switch(synth[mod_osc]->wave) {
+    case SINE: sine_mod_trigger(mod_osc); break;
+    case SAW_DOWN: saw_up_mod_trigger(mod_osc); break;
+    case SAW_UP: saw_down_mod_trigger(mod_osc); break;
+    case TRIANGLE: triangle_mod_trigger(mod_osc); break;
+    case PULSE: pulse_mod_trigger(mod_osc); break;
+    case PCM:
+    case PCM_LEFT:
+    case PCM_RIGHT:
+        pcm_mod_trigger(mod_osc);
+        break;
+    case CUSTOM: custom_mod_trigger(mod_osc); break;
+    }
+}
+
 #define DELTA_TO_SYNTH_I(FLAG, FIELD)  if (d->param == FLAG) synth[d->osc]->FIELD = d->data.i;
 #define DELTA_TO_SYNTH_F(FLAG, FIELD)  if (d->param == FLAG) synth[d->osc]->FIELD = d->data.f;
 #define DELTA_TO_COEFS(FLAG, FIELD) \
@@ -1363,9 +1387,13 @@ void play_delta(struct delta *d) {
             reset_osc(d->data.i);
         }
     }
-    if(d->param == MOD_SOURCE) {
+    if(d->param == SYNC_SOURCE) {
+        synth[d->osc]->sync_source = d->data.i;
+    }
+    if(d->param == MOD_SOURCE || d->param == MOD1_SOURCE) {
         uint16_t mod_osc = d->data.i;
-        synth[d->osc]->mod_source = mod_osc;
+        if (d->param == MOD_SOURCE) synth[d->osc]->mod_source = mod_osc;
+        else synth[d->osc]->mod1_source = mod_osc;
         // NOTE: These are delta-only side effects.  A purist would strive to remove them.
         // When an oscillator is named as a modulator, we change its state.
         ensure_osc_allocd(mod_osc, NULL);
@@ -1469,26 +1497,11 @@ void play_delta(struct delta *d) {
 
                     float initial_freq = freq_of_logfreq(initial_logfreq);
                     osc_note_on(osc, initial_freq);
-                    // trigger the mod source, if we have one
-                    uint16_t mod_osc = synth[osc]->mod_source;
-                    if(AMY_IS_SET(mod_osc)) {
-                        if (AMY_IS_SET(synth[mod_osc]->trigger_phase))
-                            synth[mod_osc]->phase = F2P(synth[mod_osc]->trigger_phase);
-                        synth[mod_osc]->note_on_clock = amy_global.total_samples;  // Need a note_on_clock to have envelope work correctly.
-                        switch(synth[mod_osc]->wave) {
-                        case SINE: sine_mod_trigger(mod_osc); break;
-                        case SAW_DOWN: saw_up_mod_trigger(mod_osc); break;
-                        case SAW_UP: saw_down_mod_trigger(mod_osc); break;
-                        case TRIANGLE: triangle_mod_trigger(mod_osc); break;
-                        case PULSE: pulse_mod_trigger(mod_osc); break;
-                        case PCM:
-                        case PCM_LEFT:
-                        case PCM_RIGHT:
-                            pcm_mod_trigger(mod_osc);
-                            break;
-                        case CUSTOM: custom_mod_trigger(mod_osc); break;
-                        }
-                    }
+                    // trigger the mod sources, if we have any
+                    if(AMY_IS_SET(synth[osc]->mod_source))
+                        trigger_mod_osc(synth[osc]->mod_source);
+                    if(AMY_IS_SET(synth[osc]->mod1_source))
+                        trigger_mod_osc(synth[osc]->mod1_source);
                 }
                 osc = synth[osc]->chained_osc;
             }
@@ -1552,7 +1565,7 @@ float amp_combine_controls(float *controls, float *coefs) {
         if (coef == 0)  continue;
         float val = controls[i];
         if (i == COEF_CONST)  {val = coef; coef = 1.0f;}   // coef[CONST] is always 1.0f, so swap them.  We're going to map the val.
-        if (i != COEF_MOD) {
+        if (i != COEF_MOD && i != COEF_MOD1) {
             val = map_60dB_to_01f(MAX(0, val)) - 1.0;    // const, vel, eg0, eg1 get log-compressed.
             // make 0 mean "no amp" and 1 mean "regular (full) amp".
         }
@@ -1583,6 +1596,7 @@ void hold_and_modify(uint16_t osc) {
     ctrl_inputs[COEF_EG0] = S2F(compute_breakpoint_scale(osc, 0, 0));
     ctrl_inputs[COEF_EG1] = S2F(compute_breakpoint_scale(osc, 1, 0));
     ctrl_inputs[COEF_MOD] = S2F(compute_mod_scale(osc));
+    ctrl_inputs[COEF_MOD1] = S2F(compute_mod1_scale(osc));
     ctrl_inputs[COEF_BEND] = amy_global.pitch_bend;
     ctrl_inputs[COEF_EXT0] = cv_inputs[0];
     ctrl_inputs[COEF_EXT1] = cv_inputs[1];

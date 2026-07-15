@@ -229,6 +229,71 @@ PHASOR render_lut_cub(SAMPLE* buf,
     return phase;
 }
 
+/* Hard sync (from koltenpearson/amy): when the sync-source osc's phase wraps,
+   reset this osc's phase to sync_start. Separate render variants keep the
+   per-sample sync check out of the normal render loops. Wrap is detected as
+   the wrapped sum going backwards, which works for both the float and
+   fixed-point PHASOR representations. */
+
+static int8_t sync_params(uint16_t osc, PHASOR *sync_phase, PHASOR *sync_step) {
+    uint16_t src = synth[osc]->sync_source;
+    if (!AMY_IS_SET(src) || src == osc || src >= AMY_OSCS) return 0;
+    if (synth[src] == NULL || msynth[src] == NULL) return 0;
+    *sync_phase = synth[src]->phase;
+    *sync_step = F2P(freq_of_logfreq(msynth[src]->logfreq) / (float)AMY_SAMPLE_RATE);
+    return 1;
+}
+
+PHASOR render_synced_lut(SAMPLE* buf,
+                         PHASOR phase,
+                         PHASOR step,
+                         PHASOR sync, PHASOR sync_step, PHASOR sync_start,
+                         SAMPLE incoming_amp, SAMPLE ending_amp,
+                         const LUT* lut,
+                         SAMPLE* pmax_value) {
+    AMY_PROFILE_START(RENDER_LUT)
+    RENDER_LUT_PREAMBLE
+    for(uint16_t i = 0; i < AMY_BLOCK_SIZE; i++) {
+        PHASOR total_phase = phase;
+
+        RENDER_LUT_GUTS(NOTHING, NOTHING, INTERP_LINEAR)
+
+        RENDER_LUT_LOOP_END
+
+        PHASOR next_sync = P_WRAPPED_SUM(sync, sync_step);
+        if (next_sync < sync) phase = sync_start;  // sync source wrapped
+        sync = next_sync;
+    }
+    *pmax_value = max_value;
+    AMY_PROFILE_STOP(RENDER_LUT)
+    return phase;
+}
+
+PHASOR render_synced_lut_cub(SAMPLE* buf,
+                             PHASOR phase,
+                             PHASOR step,
+                             PHASOR sync, PHASOR sync_step, PHASOR sync_start,
+                             SAMPLE incoming_amp, SAMPLE ending_amp,
+                             const LUT* lut,
+                             SAMPLE *pmax_value) {
+    AMY_PROFILE_START(RENDER_LUT_CUB)
+    RENDER_LUT_PREAMBLE
+    for(uint16_t i = 0; i < AMY_BLOCK_SIZE; i++) {
+        PHASOR total_phase = phase;
+
+        RENDER_LUT_GUTS(NOTHING, NOTHING, INTERP_CUBIC)
+
+        RENDER_LUT_LOOP_END
+
+        PHASOR next_sync = P_WRAPPED_SUM(sync, sync_step);
+        if (next_sync < sync) phase = sync_start;  // sync source wrapped
+        sync = next_sync;
+    }
+    *pmax_value = max_value;
+    AMY_PROFILE_STOP(RENDER_LUT_CUB)
+    return phase;
+}
+
 /* Audio in */
 
 void audio_in_note_on(uint16_t osc, uint8_t channel) {
@@ -282,15 +347,27 @@ SAMPLE render_lpf_lut(SAMPLE* buf, uint16_t osc, int8_t is_square, int8_t direct
     SAMPLE last_amp = direction * F2S(msynth[osc]->last_amp);
     PHASOR pwm_phase = synth[osc]->phase;
     SAMPLE max_value;
-    synth[osc]->phase = render_lut_cub(buf, synth[osc]->phase, step, last_amp, amp, synth[osc]->lut, &max_value);
+    PHASOR sync_phase = 0, sync_step = 0;
+    int8_t is_synced = sync_params(osc, &sync_phase, &sync_step);
+    if (is_synced)
+        synth[osc]->phase = render_synced_lut_cub(buf, synth[osc]->phase, step, sync_phase, sync_step, F2P(0), last_amp, amp, synth[osc]->lut, &max_value);
+    else
+        synth[osc]->phase = render_lut_cub(buf, synth[osc]->phase, step, last_amp, amp, synth[osc]->lut, &max_value);
     if (is_square) {  // For pulse only, add a second delayed negative LUT wave.
         float duty = msynth[osc]->duty;
         if (duty < 0.01f) duty = 0.01f;
         if (duty > 0.99f) duty = 0.99f;
-        pwm_phase = P_WRAPPED_SUM(pwm_phase, F2P(msynth[osc]->last_duty));
-        // Second pulse is given some blockwise-constant FM to maintain phase continuity across blocks.
-        PHASOR delta_phase_per_sample = F2P((duty - msynth[osc]->last_duty) / AMY_BLOCK_SIZE);
-        render_lut_cub(buf, pwm_phase, step + delta_phase_per_sample, -last_amp, -amp, synth[osc]->lut, &max_value);
+        if (is_synced) {
+            // Phase continuity matters less under hard sync; keep the second
+            // pulse a plain duty offset and re-seed it at each sync reset.
+            pwm_phase = P_WRAPPED_SUM(pwm_phase, F2P(duty));
+            render_synced_lut_cub(buf, pwm_phase, step, sync_phase, sync_step, F2P(duty), -last_amp, -amp, synth[osc]->lut, &max_value);
+        } else {
+            pwm_phase = P_WRAPPED_SUM(pwm_phase, F2P(msynth[osc]->last_duty));
+            // Second pulse is given some blockwise-constant FM to maintain phase continuity across blocks.
+            PHASOR delta_phase_per_sample = F2P((duty - msynth[osc]->last_duty) / AMY_BLOCK_SIZE);
+            render_lut_cub(buf, pwm_phase, step + delta_phase_per_sample, -last_amp, -amp, synth[osc]->lut, &max_value);
+        }
         msynth[osc]->last_duty = duty;
     }
     // Remember last_amp.
@@ -420,7 +497,11 @@ SAMPLE render_triangle(SAMPLE* buf, uint16_t osc) {
     SAMPLE amp = F2S(msynth[osc]->amp);
     SAMPLE last_amp = F2S(msynth[osc]->last_amp);
     SAMPLE max_value;
-    synth[osc]->phase = render_lut(buf, synth[osc]->phase, step, last_amp, amp, synth[osc]->lut, &max_value);
+    PHASOR sync_phase, sync_step;
+    if (sync_params(osc, &sync_phase, &sync_step))
+        synth[osc]->phase = render_synced_lut(buf, synth[osc]->phase, step, sync_phase, sync_step, F2P(0), last_amp, amp, synth[osc]->lut, &max_value);
+    else
+        synth[osc]->phase = render_lut(buf, synth[osc]->phase, step, last_amp, amp, synth[osc]->lut, &max_value);
     msynth[osc]->last_amp = msynth[osc]->amp;
     return max_value;
 }
@@ -517,7 +598,11 @@ SAMPLE render_sine(SAMPLE* buf, uint16_t osc) {
     SAMPLE last_amp = F2S(msynth[osc]->last_amp);
     //fprintf(stderr, "render_sine: time %f osc %d freq %f last_amp %f amp %f\n", amy_global.total_blocks*AMY_BLOCK_SIZE / (float)AMY_SAMPLE_RATE, osc, AMY_SAMPLE_RATE * P2F(step), S2F(last_amp), S2F(amp));
     SAMPLE max_value;
-    synth[osc]->phase = render_lut(buf, synth[osc]->phase, step, last_amp, amp, synth[osc]->lut, &max_value);
+    PHASOR sync_phase, sync_step;
+    if (sync_params(osc, &sync_phase, &sync_step))
+        synth[osc]->phase = render_synced_lut(buf, synth[osc]->phase, step, sync_phase, sync_step, F2P(0), last_amp, amp, synth[osc]->lut, &max_value);
+    else
+        synth[osc]->phase = render_lut(buf, synth[osc]->phase, step, last_amp, amp, synth[osc]->lut, &max_value);
     msynth[osc]->last_amp = msynth[osc]->amp;
     return max_value;
 }

@@ -32,8 +32,7 @@ SAMPLE compute_mod_value(uint16_t mod_osc) {
     return value;
 }
 
-SAMPLE compute_mod_scale(uint16_t osc) {
-    uint16_t source = synth[osc]->mod_source;
+static SAMPLE mod_scale_from_source(uint16_t source, uint16_t osc) {
     if(AMY_IS_SET(source)) {
         if(source != osc) {  // that would be weird
             hold_and_modify(source);
@@ -41,6 +40,14 @@ SAMPLE compute_mod_scale(uint16_t osc) {
         }
     }
     return 0; // 0 is no change, unlike bp scale
+}
+
+SAMPLE compute_mod_scale(uint16_t osc) {
+    return mod_scale_from_source(synth[osc]->mod_source, osc);
+}
+
+SAMPLE compute_mod1_scale(uint16_t osc) {
+    return mod_scale_from_source(synth[osc]->mod1_source, osc);
 }
 
 // sample_offset allows you to probe the EG output at some point this many samples into the future.
