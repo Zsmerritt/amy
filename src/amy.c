@@ -2023,14 +2023,13 @@ int16_t * amy_fill_buffer() {
         volume_scale[bus] = MUL4_SS(F2S(0.1f), F2S(amy_global.volume[bus]));
     int sum_hi = amy_global.highest_bus;
 #ifdef AMY_AUX_REVERB
-    // AUX-SEND SPIKE (docs/AUX-SENDS.md): like AMY_MASTER_REVERB, but each
+    // Aux-send reverb (docs/AUX-SENDS.md): like AMY_MASTER_REVERB, but each
     // bus feeds the shared room through its own post-fader SEND level.
     // send=1.0 everywhere reproduces master-room behavior exactly.
     if (AMY_HAS_REVERB && amy_global.bus[0]->reverb.level > 0
             && amy_global.bus[0]->reverb.rev != NULL
             && amy_global.bus[0]->reverb.rev->delay_1 != NULL) {
         static SAMPLE aux[AMY_BLOCK_SIZE * AMY_NCHANS];
-        static SAMPLE auxdry[AMY_BLOCK_SIZE * AMY_NCHANS];
         SAMPLE send_scale[AMY_NUM_BUSES];
         for (int bus = 0; bus <= amy_global.highest_bus; ++bus)
             send_scale[bus] = MUL8_SS(volume_scale[bus],
@@ -2046,23 +2045,20 @@ int16_t * amy_fill_buffer() {
                 }
                 fbl[0][0][idx] = dry;
                 aux[idx] = snd;
-                auxdry[idx] = snd;
             }
         }
-        // Spike shortcut: stereo_reverb() writes in + level*wet; run it on the
-        // aux buffer in place and add (out - in) = level*wet to the master.
-        // The production version adds a wet-only stereo_reverb variant in
-        // delay.c to drop the auxdry copy + subtract pass.
+        // Aux return: the wet-only variant ACCUMULATES level*wet straight
+        // into the master block; the send's dry never re-enters the mix.
         if (AMY_NCHANS == 1) {
-            stereo_reverb(amy_global.bus[0]->reverb.rev, aux, NULL, aux, NULL,
-                          AMY_BLOCK_SIZE, amy_global.bus[0]->reverb.level);
+            stereo_reverb_wet(amy_global.bus[0]->reverb.rev, aux, NULL,
+                              fbl[0][0], NULL, AMY_BLOCK_SIZE,
+                              amy_global.bus[0]->reverb.level);
         } else {
-            stereo_reverb(amy_global.bus[0]->reverb.rev, aux,
-                          aux + AMY_BLOCK_SIZE, aux, aux + AMY_BLOCK_SIZE,
-                          AMY_BLOCK_SIZE, amy_global.bus[0]->reverb.level);
+            stereo_reverb_wet(amy_global.bus[0]->reverb.rev, aux,
+                              aux + AMY_BLOCK_SIZE, fbl[0][0],
+                              fbl[0][0] + AMY_BLOCK_SIZE, AMY_BLOCK_SIZE,
+                              amy_global.bus[0]->reverb.level);
         }
-        for (int idx = 0; idx < AMY_BLOCK_SIZE * AMY_NCHANS; ++idx)
-            fbl[0][0][idx] += aux[idx] - auxdry[idx];
         sum_hi = 0;
         volume_scale[0] = F2S(1.0f);
     }

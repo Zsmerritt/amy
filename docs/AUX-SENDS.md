@@ -29,18 +29,32 @@ not yet run on hardware.
   sum and the send accumulation (`send_scale[bus] = volume_scale[bus] *
   reverb_send[bus]`, i.e. post-fader). Bus 0's reverb processes the aux buffer
   once; its wet output is added to the master.
-- Spike shortcut: `stereo_reverb()` emits `dry + level*wet`, so the spike keeps
-  a copy of the aux input and adds `(out - in)` to the master. **Production
-  replaces this with a wet-only `stereo_reverb` variant in delay.c** (saves a
-  2KB static buffer and a subtract pass).
+- ~~Spike shortcut: copy the aux input and add `(out - in)` to the master.~~
+  **Resolved:** `stereo_reverb_wet()` (delay.c) runs the same locals-cached
+  Stautner-Puckette loop but ACCUMULATES only `level*wet` into the target
+  buffers — the `auxdry` copy and subtract pass are gone. Mono mirrors
+  `stereo_reverb`: a NULL left input reuses the right channel, a NULL left
+  accumulator discards d2's wet (it still feeds the feedback matrix).
+
+## What has landed on this branch (beyond the spike)
+
+- `stereo_reverb_wet()` in delay.c/h; the render block uses it directly.
+- Patch persistence: `reverb_send` stores (`q` in wire strings /
+  `reverb_send:` in dict form), participates in the is-empty test, and
+  recalls via the `REVERB_SEND` delta — same `_EPRINT_F`/`_CASE_F` family as
+  the other bus FX fields.
+- Python wire map: `('reverb_send', 'qF')` in `amy/__init__.py`.
+- Verified: `-fsyntax-only` matrix over amy.c/delay.c/parse.c/api.c/patches.c
+  under `-DAMY_AUX_REVERB`, `-DAMY_MASTER_REVERB`, and stock (no flag) — all
+  15 green. No host C compiler on this machine, so no runnable desktop render
+  test yet; the A/B in step 8 below is the functional gate.
 
 ## Cost
 
 - CPU: identical to `AMY_MASTER_REVERB` plus one extra multiply-accumulate per
   bus per sample in the fold (buses ≤ 4, negligible next to the reverb itself).
   Still exactly one reverb.
-- RAM: two static 2KB block buffers in the spike; one after the wet-only
-  variant lands.
+- RAM: one static 2KB block buffer.
 
 ## Implementation plan (production)
 

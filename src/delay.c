@@ -412,3 +412,107 @@ void stereo_reverb(reverb_params_t *rev, SAMPLE *r_in, SAMPLE *l_in, SAMPLE *r_o
     rev->f3state = f3state;
     rev->f4state = f4state;
 }
+
+void stereo_reverb_wet(reverb_params_t *rev, SAMPLE *r_in, SAMPLE *l_in, SAMPLE *r_acc, SAMPLE *l_acc_out, int n_samples, SAMPLE level) {
+    // Same Stautner-Puckette network as stereo_reverb(), but an aux RETURN:
+    // reads the send mix from {r,l}_in and ACCUMULATES only level*wet into
+    // {r,l}_acc -- the dry signal is already in the master sum, so emitting
+    // in + level*wet here (as stereo_reverb does) would double it.  Kept as a
+    // separate function, not a flag, to match this file's no-branch-in-the-
+    // sample-loop idiom (see render_lut's family in oscillators.c).
+    // Mono mirrors stereo_reverb: l_in NULL reuses the right input, and a
+    // NULL left accumulator discards d2's wet (it still feeds the matrix).
+    DL_LOAD(e1, rev->ref_1);
+    DL_LOAD(e2, rev->ref_2);
+    DL_LOAD(e3, rev->ref_3);
+    DL_LOAD(e4, rev->ref_4);
+    DL_LOAD(e5, rev->ref_5);
+    DL_LOAD(e6, rev->ref_6);
+    DL_LOAD(dl1, rev->delay_1);
+    DL_LOAD(dl2, rev->delay_2);
+    DL_LOAD(dl3, rev->delay_3);
+    DL_LOAD(dl4, rev->delay_4);
+
+    SAMPLE lpfcoef = rev->lpfcoef, lpfgain = rev->lpfgain, liveness = rev->liveness;
+    SAMPLE f1state = rev->f1state, f2state = rev->f2state;
+    SAMPLE f3state = rev->f3state, f4state = rev->f4state;
+
+    while(n_samples--) {
+        // Early echo reflections.
+        SAMPLE in_r = *r_in++;
+        SAMPLE in_l;
+        if (l_in)   in_l = *l_in++;
+        else   in_l = in_r;
+        SAMPLE r_acc_s, l_acc_s;
+        r_acc_s = MUL0_SS(F2S(0.0625f), in_r);
+        l_acc_s = MUL0_SS(F2S(0.0625f), in_l);
+
+        DL_WRITE(e1, l_acc_s);
+        SAMPLE d_out = DL_READ(e1);
+        l_acc_s = r_acc_s - d_out;
+        r_acc_s += d_out;
+
+        DL_WRITE(e2, l_acc_s);
+        d_out = DL_READ(e2);
+        l_acc_s = r_acc_s - d_out;
+        r_acc_s += d_out;
+
+        DL_WRITE(e3, l_acc_s);
+        d_out = DL_READ(e3);
+        l_acc_s = r_acc_s - d_out;
+        r_acc_s += d_out;
+
+        DL_WRITE(e4, l_acc_s);
+        d_out = DL_READ(e4);
+        l_acc_s = r_acc_s - d_out;
+        r_acc_s += d_out;
+
+        DL_WRITE(e5, l_acc_s);
+        d_out = DL_READ(e5);
+        l_acc_s = r_acc_s - d_out;
+        r_acc_s += d_out;
+
+        DL_WRITE(e6, l_acc_s);
+        l_acc_s = DL_READ(e6);
+
+
+        // Reverb delays & matrix.
+        SAMPLE d1 = DL_READ(dl1);
+        d1 = LPF(d1, &f1state, lpfcoef, lpfgain, liveness);
+        d1 += r_acc_s;
+        *r_acc++ += MUL8_SS(level, d1);
+
+        SAMPLE d2 = DL_READ(dl2);
+        d2 = LPF(d2, &f2state, lpfcoef, lpfgain, liveness);
+        d2 += l_acc_s;
+        if (l_acc_out != NULL)  *l_acc_out++ += MUL8_SS(level, d2);
+
+        SAMPLE d3 = DL_READ(dl3);
+        d3 = LPF(d3, &f3state, lpfcoef, lpfgain, liveness);
+
+        SAMPLE d4 = DL_READ(dl4);
+        d4 = LPF(d4, &f4state, lpfcoef, lpfgain, liveness);
+
+        // Mixing and feedback.
+        DL_WRITE(dl1, d1 + d2 + d3 + d4);
+        DL_WRITE(dl2, d1 - d2 + d3 - d4);
+        DL_WRITE(dl3, d1 + d2 - d3 - d4);
+        DL_WRITE(dl4, d1 - d2 - d3 + d4);
+    }
+
+    // Write back the advanced write indices and the filter state.
+    rev->ref_1->next_in = e1_n;
+    rev->ref_2->next_in = e2_n;
+    rev->ref_3->next_in = e3_n;
+    rev->ref_4->next_in = e4_n;
+    rev->ref_5->next_in = e5_n;
+    rev->ref_6->next_in = e6_n;
+    rev->delay_1->next_in = dl1_n;
+    rev->delay_2->next_in = dl2_n;
+    rev->delay_3->next_in = dl3_n;
+    rev->delay_4->next_in = dl4_n;
+    rev->f1state = f1state;
+    rev->f2state = f2state;
+    rev->f3state = f3state;
+    rev->f4state = f4state;
+}

@@ -19,5 +19,7 @@ void config_stereo_reverb(reverb_params_t *rev, float a_liveness, float crossove
 bool init_stereo_reverb(reverb_params_t *rev);
 void deinit_stereo_reverb(reverb_params_t *rev);
 void stereo_reverb(reverb_params_t *rev, SAMPLE *r_in, SAMPLE *l_in, SAMPLE *r_out, SAMPLE *l_out, int n_samples, SAMPLE level);
+// Aux-return variant: ACCUMULATES level*wet into {r,l}_acc, never the dry.
+void stereo_reverb_wet(reverb_params_t *rev, SAMPLE *r_in, SAMPLE *l_in, SAMPLE *r_acc, SAMPLE *l_acc, int n_samples, SAMPLE level);
 
 #endif // !_DELAY_H
