@@ -1401,7 +1401,8 @@
     ]
    },
    "programs_covered": 96,
-   "low_confidence": 11
+   "low_confidence": 11,
+   "source_font": "merged multi-font (E-mu .L08 + structured names); digit-anchored"
   },
   {
    "block": 1,
@@ -2682,7 +2683,8 @@
     ]
    },
    "programs_covered": 76,
-   "low_confidence": 30
+   "low_confidence": 30,
+   "source_font": "Creative/E-mu 8MB GM lineage; public restoration disagrees - order-based map, verify by ear"
   },
   {
    "block": 4,
@@ -3978,9 +3980,9 @@
        92
       ]
      ],
-     "conf": "high"
+     "conf": "order"
     },
-    "1": {
+    "2": {
      "zones": [
       [
        881,
@@ -3991,9 +3993,9 @@
        89
       ]
      ],
-     "conf": "low"
+     "conf": "verified"
     },
-    "2": {
+    "4": {
      "zones": [
       [
        883,
@@ -4004,7 +4006,7 @@
        78
       ]
      ],
-     "conf": "low"
+     "conf": "verified"
     },
     "5": {
      "zones": [
@@ -4017,7 +4019,7 @@
        80
       ]
      ],
-     "conf": "high"
+     "conf": "verified"
     },
     "6": {
      "zones": [
@@ -4030,7 +4032,7 @@
        77
       ]
      ],
-     "conf": "high"
+     "conf": "verified"
     },
     "7": {
      "zones": [
@@ -4043,7 +4045,7 @@
        80
       ]
      ],
-     "conf": "high"
+     "conf": "order"
     },
     "8": {
      "zones": [
@@ -4052,7 +4054,7 @@
        91
       ]
      ],
-     "conf": "high"
+     "conf": "verified"
     },
     "9": {
      "zones": [
@@ -4061,7 +4063,7 @@
        94
       ]
      ],
-     "conf": "high"
+     "conf": "verified"
     },
     "10": {
      "zones": [
@@ -4070,7 +4072,7 @@
        89
       ]
      ],
-     "conf": "high"
+     "conf": "verified"
     },
     "11": {
      "zones": [
@@ -4083,7 +4085,7 @@
        81
       ]
      ],
-     "conf": "high"
+     "conf": "verified"
     },
     "12": {
      "zones": [
@@ -4092,7 +4094,7 @@
        68
       ]
      ],
-     "conf": "high"
+     "conf": "verified"
     },
     "13": {
      "zones": [
@@ -4101,7 +4103,7 @@
        79
       ]
      ],
-     "conf": "high"
+     "conf": "verified"
     },
     "14": {
      "zones": [
@@ -4110,7 +4112,7 @@
        86
       ]
      ],
-     "conf": "high"
+     "conf": "verified"
     },
     "15": {
      "zones": [
@@ -4123,7 +4125,7 @@
        78
       ]
      ],
-     "conf": "low"
+     "conf": "verified"
     },
     "16": {
      "zones": [
@@ -4136,7 +4138,7 @@
        90
       ]
      ],
-     "conf": "high"
+     "conf": "verified"
     },
     "17": {
      "zones": [
@@ -4145,7 +4147,7 @@
        78
       ]
      ],
-     "conf": "high"
+     "conf": "verified"
     },
     "18": {
      "zones": [
@@ -4158,7 +4160,7 @@
        95
       ]
      ],
-     "conf": "low"
+     "conf": "verified"
     },
     "19": {
      "zones": [
@@ -4171,7 +4173,7 @@
        79
       ]
      ],
-     "conf": "high"
+     "conf": "verified"
     },
     "21": {
      "zones": [
@@ -4184,7 +4186,7 @@
        89
       ]
      ],
-     "conf": "high"
+     "conf": "verified"
     },
     "22": {
      "zones": [
@@ -4197,7 +4199,7 @@
        82
       ]
      ],
-     "conf": "high"
+     "conf": "verified"
     },
     "24": {
      "zones": [
@@ -4210,7 +4212,7 @@
        72
       ]
      ],
-     "conf": "high"
+     "conf": "verified"
     },
     "25": {
      "zones": [
@@ -4223,7 +4225,7 @@
        73
       ]
      ],
-     "conf": "high"
+     "conf": "verified"
     },
     "26": {
      "zones": [
@@ -4236,7 +4238,7 @@
        75
       ]
      ],
-     "conf": "high"
+     "conf": "verified"
     },
     "27": {
      "zones": [
@@ -4249,7 +4251,7 @@
        74
       ]
      ],
-     "conf": "high"
+     "conf": "verified"
     },
     "28": {
      "zones": [
@@ -4262,7 +4264,7 @@
        67
       ]
      ],
-     "conf": "high"
+     "conf": "verified"
     },
     "29": {
      "zones": [
@@ -4275,7 +4277,7 @@
        60
       ]
      ],
-     "conf": "low"
+     "conf": "verified"
     },
     "30": {
      "zones": [
@@ -4288,7 +4290,7 @@
        60
       ]
      ],
-     "conf": "high"
+     "conf": "verified"
     },
     "31": {
      "zones": [
@@ -4301,7 +4303,7 @@
        71
       ]
      ],
-     "conf": "high"
+     "conf": "verified"
     },
     "32": {
      "zones": [
@@ -4314,7 +4316,7 @@
        51
       ]
      ],
-     "conf": "high"
+     "conf": "verified"
     },
     "33": {
      "zones": [
@@ -4323,7 +4325,7 @@
        48
       ]
      ],
-     "conf": "high"
+     "conf": "verified"
     },
     "34": {
      "zones": [
@@ -4332,7 +4334,7 @@
        46
       ]
      ],
-     "conf": "high"
+     "conf": "verified"
     },
     "35": {
      "zones": [
@@ -4345,7 +4347,7 @@
        56
       ]
      ],
-     "conf": "high"
+     "conf": "verified"
     },
     "36": {
      "zones": [
@@ -4356,7 +4358,12 @@
       [
        935,
        48
-      ],
+      ]
+     ],
+     "conf": "verified"
+    },
+    "37": {
+     "zones": [
       [
        936,
        43
@@ -4366,9 +4373,9 @@
        51
       ]
      ],
-     "conf": "high"
+     "conf": "verified"
     },
-    "39": {
+    "38": {
      "zones": [
       [
        938,
@@ -4379,7 +4386,7 @@
        64
       ]
      ],
-     "conf": "high"
+     "conf": "verified"
     },
     "40": {
      "zones": [
@@ -4396,7 +4403,7 @@
        87
       ]
      ],
-     "conf": "high"
+     "conf": "verified"
     },
     "42": {
      "zones": [
@@ -4409,7 +4416,7 @@
        82
       ]
      ],
-     "conf": "high"
+     "conf": "verified"
     },
     "43": {
      "zones": [
@@ -4422,7 +4429,7 @@
        50
       ]
      ],
-     "conf": "high"
+     "conf": "verified"
     },
     "44": {
      "zones": [
@@ -4435,7 +4442,7 @@
        89
       ]
      ],
-     "conf": "low"
+     "conf": "order"
     },
     "45": {
      "zones": [
@@ -4448,7 +4455,7 @@
        84
       ]
      ],
-     "conf": "high"
+     "conf": "verified"
     },
     "46": {
      "zones": [
@@ -4461,7 +4468,7 @@
        87
       ]
      ],
-     "conf": "high"
+     "conf": "order"
     },
     "47": {
      "zones": [
@@ -4470,9 +4477,9 @@
        67
       ]
      ],
-     "conf": "high"
+     "conf": "verified"
     },
-    "48": {
+    "50": {
      "zones": [
       [
        954,
@@ -4483,7 +4490,7 @@
        87
       ]
      ],
-     "conf": "high"
+     "conf": "verified"
     },
     "52": {
      "zones": [
@@ -4496,7 +4503,7 @@
        85
       ]
      ],
-     "conf": "high"
+     "conf": "order"
     },
     "53": {
      "zones": [
@@ -4509,7 +4516,7 @@
        83
       ]
      ],
-     "conf": "high"
+     "conf": "verified"
     },
     "54": {
      "zones": [
@@ -4522,7 +4529,7 @@
        80
       ]
      ],
-     "conf": "high"
+     "conf": "verified"
     },
     "55": {
      "zones": [
@@ -4531,7 +4538,7 @@
        80
       ]
      ],
-     "conf": "high"
+     "conf": "verified"
     },
     "56": {
      "zones": [
@@ -4544,7 +4551,7 @@
        88
       ]
      ],
-     "conf": "high"
+     "conf": "verified"
     },
     "57": {
      "zones": [
@@ -4557,7 +4564,7 @@
        80
       ]
      ],
-     "conf": "high"
+     "conf": "verified"
     },
     "58": {
      "zones": [
@@ -4570,7 +4577,7 @@
        60
       ]
      ],
-     "conf": "high"
+     "conf": "verified"
     },
     "59": {
      "zones": [
@@ -4583,7 +4590,7 @@
        90
       ]
      ],
-     "conf": "high"
+     "conf": "verified"
     },
     "60": {
      "zones": [
@@ -4596,7 +4603,7 @@
        81
       ]
      ],
-     "conf": "high"
+     "conf": "verified"
     },
     "61": {
      "zones": [
@@ -4607,7 +4614,12 @@
       [
        974,
        88
-      ],
+      ]
+     ],
+     "conf": "verified"
+    },
+    "62": {
+     "zones": [
       [
        975,
        64
@@ -4617,7 +4629,7 @@
        81
       ]
      ],
-     "conf": "high"
+     "conf": "verified"
     },
     "64": {
      "zones": [
@@ -4630,7 +4642,7 @@
        87
       ]
      ],
-     "conf": "high"
+     "conf": "verified"
     },
     "65": {
      "zones": [
@@ -4643,7 +4655,7 @@
        86
       ]
      ],
-     "conf": "high"
+     "conf": "order"
     },
     "66": {
      "zones": [
@@ -4656,7 +4668,7 @@
        83
       ]
      ],
-     "conf": "low"
+     "conf": "verified"
     },
     "67": {
      "zones": [
@@ -4669,7 +4681,7 @@
        72
       ]
      ],
-     "conf": "high"
+     "conf": "verified"
     },
     "68": {
      "zones": [
@@ -4682,7 +4694,7 @@
        85
       ]
      ],
-     "conf": "high"
+     "conf": "verified"
     },
     "69": {
      "zones": [
@@ -4695,7 +4707,7 @@
        85
       ]
      ],
-     "conf": "high"
+     "conf": "verified"
     },
     "70": {
      "zones": [
@@ -4708,7 +4720,7 @@
        72
       ]
      ],
-     "conf": "high"
+     "conf": "verified"
     },
     "71": {
      "zones": [
@@ -4721,7 +4733,7 @@
        84
       ]
      ],
-     "conf": "high"
+     "conf": "verified"
     },
     "72": {
      "zones": [
@@ -4730,7 +4742,7 @@
        90
       ]
      ],
-     "conf": "high"
+     "conf": "verified"
     },
     "73": {
      "zones": [
@@ -4743,7 +4755,7 @@
        88
       ]
      ],
-     "conf": "high"
+     "conf": "verified"
     },
     "74": {
      "zones": [
@@ -4752,7 +4764,7 @@
        80
       ]
      ],
-     "conf": "high"
+     "conf": "verified"
     },
     "75": {
      "zones": [
@@ -4761,7 +4773,7 @@
        71
       ]
      ],
-     "conf": "low"
+     "conf": "order"
     },
     "77": {
      "zones": [
@@ -4770,7 +4782,7 @@
        86
       ]
      ],
-     "conf": "high"
+     "conf": "verified"
     },
     "79": {
      "zones": [
@@ -4779,7 +4791,7 @@
        88
       ]
      ],
-     "conf": "high"
+     "conf": "verified"
     },
     "80": {
      "zones": [
@@ -4792,7 +4804,7 @@
        84
       ]
      ],
-     "conf": "high"
+     "conf": "verified"
     },
     "81": {
      "zones": [
@@ -4805,7 +4817,7 @@
        84
       ]
      ],
-     "conf": "high"
+     "conf": "verified"
     },
     "82": {
      "zones": [
@@ -4814,9 +4826,9 @@
        90
       ]
      ],
-     "conf": "low"
+     "conf": "order"
     },
-    "83": {
+    "84": {
      "zones": [
       [
        1005,
@@ -4827,7 +4839,7 @@
        88
       ]
      ],
-     "conf": "low"
+     "conf": "verified"
     },
     "85": {
      "zones": [
@@ -4840,9 +4852,9 @@
        82
       ]
      ],
-     "conf": "high"
+     "conf": "order"
     },
-    "86": {
+    "87": {
      "zones": [
       [
        1009,
@@ -4851,36 +4863,26 @@
       [
        1010,
        74
-      ]
-     ],
-     "conf": "low"
-    },
-    "87": {
-     "zones": [
+      ],
       [
        1011,
        71
       ]
      ],
-     "conf": "low"
+     "conf": "verified"
     },
-    "88": {
+    "93": {
      "zones": [
       [
        1012,
        68
-      ]
-     ],
-     "conf": "low"
-    },
-    "89": {
-     "zones": [
+      ],
       [
        1013,
        72
       ]
      ],
-     "conf": "low"
+     "conf": "verified"
     },
     "90": {
      "zones": [
@@ -4889,9 +4891,9 @@
        75
       ]
      ],
-     "conf": "low"
+     "conf": "verified"
     },
-    "91": {
+    "103": {
      "zones": [
       [
        1015,
@@ -4902,7 +4904,7 @@
        80
       ]
      ],
-     "conf": "low"
+     "conf": "verified"
     },
     "104": {
      "zones": [
@@ -4911,7 +4913,7 @@
        63
       ]
      ],
-     "conf": "high"
+     "conf": "verified"
     },
     "105": {
      "zones": [
@@ -4924,7 +4926,7 @@
        73
       ]
      ],
-     "conf": "high"
+     "conf": "verified"
     },
     "106": {
      "zones": [
@@ -4937,7 +4939,7 @@
        77
       ]
      ],
-     "conf": "low"
+     "conf": "verified"
     },
     "107": {
      "zones": [
@@ -4950,7 +4952,7 @@
        78
       ]
      ],
-     "conf": "high"
+     "conf": "verified"
     },
     "108": {
      "zones": [
@@ -4959,7 +4961,7 @@
        68
       ]
      ],
-     "conf": "high"
+     "conf": "verified"
     },
     "109": {
      "zones": [
@@ -4972,7 +4974,7 @@
        79
       ]
      ],
-     "conf": "high"
+     "conf": "verified"
     },
     "111": {
      "zones": [
@@ -4985,7 +4987,7 @@
        83
       ]
      ],
-     "conf": "high"
+     "conf": "verified"
     },
     "112": {
      "zones": [
@@ -4994,7 +4996,7 @@
        40
       ]
      ],
-     "conf": "low"
+     "conf": "verified"
     },
     "113": {
      "zones": [
@@ -5003,7 +5005,7 @@
        72
       ]
      ],
-     "conf": "high"
+     "conf": "verified"
     },
     "114": {
      "zones": [
@@ -5012,7 +5014,7 @@
        77
       ]
      ],
-     "conf": "high"
+     "conf": "verified"
     },
     "115": {
      "zones": [
@@ -5021,7 +5023,7 @@
        94
       ]
      ],
-     "conf": "high"
+     "conf": "verified"
     },
     "116": {
      "zones": [
@@ -5030,7 +5032,7 @@
        90
       ]
      ],
-     "conf": "high"
+     "conf": "verified"
     },
     "117": {
      "zones": [
@@ -5039,7 +5041,7 @@
        52
       ]
      ],
-     "conf": "low"
+     "conf": "verified"
     },
     "118": {
      "zones": [
@@ -5048,7 +5050,7 @@
        84
       ]
      ],
-     "conf": "high"
+     "conf": "verified"
     },
     "119": {
      "zones": [
@@ -5057,39 +5059,29 @@
        56
       ]
      ],
-     "conf": "low"
+     "conf": "verified"
     }
    },
    "drums": {
     "27": [
      1037,
      29,
-     "high"
+     "verified"
     ],
     "28": [
      1038,
      34,
-     "high"
+     "verified"
     ],
     "29": [
      1039,
      38,
-     "low"
+     "verified"
     ],
     "31": [
      1040,
      41,
-     "high"
-    ],
-    "32": [
-     1042,
-     39,
-     "high"
-    ],
-    "33": [
-     1043,
-     40,
-     "high"
+     "verified"
     ],
     "34": [
      1044,
@@ -5104,57 +5096,52 @@
     "37": [
      1046,
      45,
-     "high"
+     "verified"
     ],
     "38": [
      1047,
      46,
-     "high"
+     "verified"
     ],
     "39": [
      1048,
      49,
-     "high"
+     "verified"
     ],
     "40": [
      1049,
      50,
-     "high"
+     "verified"
     ],
     "41": [
      1050,
      52,
-     "low"
+     "verified"
     ],
     "42": [
      1051,
      46,
-     "high"
-    ],
-    "43": [
-     1052,
-     48,
-     "low"
+     "verified"
     ],
     "46": [
      1053,
      52,
-     "high"
+     "verified"
     ],
     "47": [
      1054,
      50,
-     "low"
+     "verified"
     ],
     "49": [
      1055,
      56,
-     "high"
+     "verified"
     ],
     "51": [
      1056,
      59,
-     "high"
+     "verified"
     ],
     "52": [
      1057,
@@ -5164,12 +5151,12 @@
     "53": [
      1058,
      59,
-     "high"
+     "verified"
     ],
     "54": [
      1059,
      64,
-     "high"
+     "verified"
     ],
     "55": [
      1060,
@@ -5179,22 +5166,22 @@
     "56": [
      1061,
      64,
-     "high"
+     "verified"
     ],
     "57": [
      1062,
      63,
-     "high"
+     "verified"
     ],
     "58": [
      1063,
      74,
-     "high"
+     "verified"
     ],
     "59": [
      1064,
      66,
-     "low"
+     "verified"
     ],
     "60": [
      1065,
@@ -5204,136 +5191,142 @@
     "61": [
      1066,
      73,
-     "high"
+     "verified"
     ],
     "62": [
      1067,
      73,
-     "high"
+     "verified"
     ],
     "63": [
      1068,
      80,
-     "high"
+     "verified"
     ],
     "64": [
      1069,
      76,
-     "high"
-    ],
-    "65": [
-     1071,
-     77,
-     "high"
-    ],
-    "66": [
-     1072,
-     72,
-     "low"
+     "verified"
     ],
     "67": [
      1073,
      78,
-     "high"
+     "verified"
     ],
     "69": [
      1074,
      77,
-     "high"
+     "verified"
     ],
     "70": [
      1075,
      79,
-     "high"
+     "verified"
     ],
     "71": [
      1076,
      76,
-     "high"
+     "verified"
     ],
     "72": [
      1077,
      80,
-     "low"
+     "verified"
     ],
     "73": [
      1078,
      84,
-     "high"
+     "verified"
     ],
     "74": [
      1079,
      81,
-     "high"
+     "verified"
     ],
     "75": [
      1080,
      85,
-     "high"
+     "verified"
     ],
     "76": [
      1081,
      94,
-     "high"
+     "verified"
     ],
     "77": [
      1082,
      100,
-     "low"
+     "verified"
     ],
     "78": [
      1083,
      90,
-     "high"
+     "verified"
     ],
     "79": [
      1084,
      94,
-     "high"
+     "verified"
     ],
     "80": [
      1085,
      88,
-     "high"
+     "verified"
     ],
     "81": [
      1086,
      94,
-     "high"
+     "verified"
     ],
     "82": [
      1087,
      79,
-     "low"
+     "verified"
     ],
     "83": [
      1088,
      92,
-     "high"
+     "verified"
     ],
     "84": [
      1089,
      93,
-     "high"
+     "verified"
     ],
     "85": [
      1090,
      94,
-     "high"
+     "verified"
     ],
     "86": [
      1091,
      90,
-     "low"
+     "verified"
     ],
     "87": [
      1092,
      98,
-     "high"
+     "verified"
+    ],
+    "33": [
+     1042,
+     39,
+     "verified"
+    ],
+    "44": [
+     1052,
+     48,
+     "verified"
+    ],
+    "66": [
+     1071,
+     77,
+     "verified"
     ]
    },
    "programs_covered": 92,
-   "low_confidence": 20
+   "low_confidence": 20,
+   "source_font": "4GMGSMT.SF2 (E-mu 4MB GM/GS/MT) - preset graph verified"
   }
  ],
  "wave_fonts": [
@@ -6612,5 +6605,6 @@
     ]
    ]
   }
- ]
+ ],
+ "verification": "block 5 verified against authentic 4GMGSMT.SF2 (20 reassignments); block 3 = VintageDreamsWaves-v2 (wave font); block 1/4 sources not authenticated (restoration mismatch / unknown @#$-prefix bank)"
 }
