@@ -16,6 +16,11 @@ uint16_t next_user_patch_index = 0;
 uint8_t * osc_to_voice = NULL;
 uint16_t *voice_to_base_osc = NULL;
 
+// Number of low-numbered oscs the host drives directly and the patch/voice
+// allocator must never claim.  0 (default) = allocator may use every osc.
+// (from Leeman1982/amy)
+uint16_t amy_reserved_oscs = 0;
+
 void patches_deinit() {
     memory_patch_deltas = NULL;
     memory_patch_oscs = NULL;
@@ -1163,21 +1168,28 @@ void patches_load_patch(amy_event *e) {
         // Find the first osc with oscs_per_voice free oscs.
         uint8_t good = 0;
 
-        uint16_t osc_start = (AMY_OSCS/2);
+        // Hosts that drive low-numbered oscs directly (outside the voice
+        // allocator's knowledge) set amy_reserved_oscs; the scan never
+        // touches oscs below that floor.
+        uint16_t reserved = amy_reserved_oscs;
+        if (reserved >= AMY_OSCS) reserved = 0;
+        uint16_t span = AMY_OSCS - reserved;
+
+        uint16_t osc_start = reserved + (span/2);
 
         #ifdef TULIP
         // On tulip. core 0 (oscs0-60) is shared with the display, who does GDMA a lot. so we favor core1 (oscs60-120)
-        if(voices[v]%3==2) osc_start = 0;
+        if(voices[v]%3==2) osc_start = reserved;
         #else
-        if(voices[v]%2==1) osc_start = 0;
+        if(voices[v]%2==1) osc_start = reserved;
         #endif
 
-        for(uint16_t i=0;i<AMY_OSCS;i++) {
-            uint16_t osc = (osc_start + i) % AMY_OSCS;
+        for(uint16_t i=0;i<span;i++) {
+            uint16_t osc = reserved + (uint16_t)((osc_start - reserved + i) % span);
             if(AMY_IS_UNSET(osc_to_voice[osc])) {
                 // Are there num_voices x oscs_per_voice free oscs after this one?
-                good = 1;
-                for(uint16_t j=0; j < oscs_per_voice; j++) {
+                good = (osc + oscs_per_voice <= AMY_OSCS);
+                for(uint16_t j=0; good && j < oscs_per_voice; j++) {
                     good = good & (AMY_IS_UNSET(osc_to_voice[osc + j]));
                 }
                 if(good) {

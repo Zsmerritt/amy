@@ -109,6 +109,11 @@ extern const uint32_t pcm_wavetable_len;
 // Until the pointer is set those presets are silently unavailable.
 extern const int16_t * gamma9001_pcm;
 extern void amy_set_gamma9001_pcm(const int16_t * data);
+extern void amy_set_gm_pcm(const int16_t * data);
+
+// Oscs below this floor are never auto-allocated to patch voices -- for hosts
+// that drive low-numbered oscs directly alongside the patch/instrument layer.
+extern uint16_t amy_reserved_oscs;
 #endif
 
 // File-streaming buffer size multiplier (in blocks).

@@ -51,6 +51,16 @@ void amy_set_gamma9001_pcm(const int16_t * data) {
 }
 #endif
 
+#ifdef GM_FONTS
+#include "pcm_gm.h"
+// Set by the platform at boot: ESP32-S3 passes the esp_partition_mmap'd
+// `fonts` partition. NULL = GM presets unavailable.
+const int16_t * gm_pcm = NULL;
+void amy_set_gm_pcm(const int16_t * data) {
+    gm_pcm = data;
+}
+#endif
+
 
 // Get either memory preset, file preset or baked in preset for preset number.
 // For ROM presets, fill the caller-provided rom_local and return it.
@@ -82,6 +92,27 @@ memorypcm_preset_t * get_preset_for_preset_number(uint16_t preset_number,
         rom_local->midinote = g->midinote;
         rom_local->samplerate = GAMMA9001_SAMPLE_RATE;
         rom_local->log2sr = log2f((float)GAMMA9001_SAMPLE_RATE / ZERO_LOGFREQ_IN_HZ);
+        rom_local->type = AMY_PCM_TYPE_GAMMA;
+        rom_local->channels = 1;
+        return rom_local;
+    }
+#endif
+
+#ifdef GM_FONTS
+    // GM SoundFont presets live at GM_PRESET_BASE+, read straight out of the
+    // mmapped fonts partition (memory presets above may still shadow them).
+    if (preset_number >= GM_PRESET_BASE &&
+        preset_number < GM_PRESET_BASE + GM_NUM_SAMPLES &&
+        gm_pcm != NULL && rom_local != NULL) {
+        const pcm_map_t *g = &gm_map[preset_number - GM_PRESET_BASE];
+        memset(rom_local, 0, sizeof(*rom_local));
+        rom_local->sample_ram = (int16_t *)gm_pcm + g->offset;
+        rom_local->length = g->length;
+        rom_local->loopstart = g->loopstart;
+        rom_local->loopend = g->loopend;
+        rom_local->midinote = g->midinote;
+        rom_local->samplerate = GM_SAMPLE_RATE;
+        rom_local->log2sr = log2f((float)GM_SAMPLE_RATE / ZERO_LOGFREQ_IN_HZ);
         rom_local->type = AMY_PCM_TYPE_GAMMA;
         rom_local->channels = 1;
         return rom_local;
@@ -200,6 +231,15 @@ void pcm_mod_trigger(uint16_t osc) {
 
 void pcm_note_off(uint16_t osc) {
     if(AMY_IS_SET(synth[osc]->preset)) {
+        // feedback >= 2: "sustain through release" (from Leeman1982/amy) -- the
+        // host has an amp envelope with a meaningful release stage, so don't
+        // stop the sample here: looped presets keep looping, one-shots keep
+        // playing to their natural end, and the EG fades the voice (the osc
+        // stops when the envelope completes). Without this, the release stage
+        // had at most the sample's loop tail (~tens of ms) to act on.
+        if(msynth[osc]->feedback >= 2) {
+            return;
+        }
         uint32_t length = 0;
         memorypcm_preset_t rom_local;
         memorypcm_preset_t *preset =
@@ -323,10 +363,16 @@ SAMPLE render_pcm(SAMPLE* buf, uint16_t osc) {
                 } else {
                     if(msynth[osc]->feedback > 0) { // still looping.  The feedback flag is cleared by pcm_note_off.
                         if(base_index >= preset->loopend) { // loopend
-                            // back to loopstart
+                            // back to loopstart -- but only for a real sustain
+                            // loop. One-shot presets have loopend == length;
+                            // wrapping those would machine-gun the whole sample
+                            // (reachable via feedback >= 2 sustain-through-
+                            // release on a one-shot).
                             int32_t loop_len = preset->loopend - preset->loopstart;
-                            synth[osc]->phase -= F2P(loop_len / (float)(1 << PCM_INDEX_BITS));
-                            base_index -= loop_len;
+                            if(loop_len > 0 && (uint32_t)loop_len < preset->length) {
+                                synth[osc]->phase -= F2P(loop_len / (float)(1 << PCM_INDEX_BITS));
+                                base_index -= loop_len;
+                            }
                         }
                     }
                 }
