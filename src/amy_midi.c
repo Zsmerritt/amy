@@ -100,7 +100,16 @@ void amy_mpe_config(uint8_t master_channel, int num_members, float bend_range) {
     mpe_state_t *mpe = &amy_global.mpe;
     if (num_members < 0) num_members = 0;
     if (num_members > 15) num_members = 15;
-    mpe->master_channel = (master_channel == 16) ? 16 : master_channel;
+    if (master_channel < 1 || master_channel > 16) {
+        // Callers pass the synth number as the zone master (parse.c iE routes
+        // through e->synth), and synths can be numbered past 16. A master
+        // outside 1-16 can never match a MIDI channel, so storing it would
+        // just leave a zone that silently never fires -- reject it instead.
+        fprintf(stderr, "amy_mpe_config: master channel %d out of range 1-16; ignoring\n",
+                master_channel);
+        return;
+    }
+    mpe->master_channel = master_channel;
     mpe->num_members = num_members;
     if (AMY_IS_SET(bend_range) && bend_range > 0) mpe->member_bend_range = bend_range;
     for (int ch = 0; ch < 17; ++ch) {
@@ -146,6 +155,10 @@ void amy_received_control_change(uint8_t channel, uint8_t control, uint8_t value
         } else if (mpe->rpn_msb[channel] == 0 && mpe->rpn_lsb[channel] == 0
                    && amy_mpe_is_member_channel(channel)) {
             // Pitch bend sensitivity on a member channel sets the zone's member bend range.
+            // Spec deviation: the MPE spec also defines RPN 0 on the MASTER
+            // channel (master-channel bend range); we deliberately leave that
+            // to AMY's global pitch_bend handling and only honor member-channel
+            // sensitivity here.
             mpe->member_bend_range = (float)value;
         }
     }
