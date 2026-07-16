@@ -54,7 +54,7 @@ uint64_t profile_start_us = 0;
 // the same oscs -- a concrete use-after-free. Loaders raise this, wait a
 // bounded block-boundary handshake (same idiom as the flash fence), load,
 // drop. Renders emit silence while it is up.
-volatile uint8_t amy_patch_loading = 0;
+volatile uint32_t amy_patch_loading = 0;   // FW-4: counted gate (two concurrent loaders)
 int64_t amy_get_us() { return esp_timer_get_time(); }
 #elif defined PICO_ON_DEVICE
 int64_t amy_get_us() { return to_us_since_boot(get_absolute_time()); }
@@ -310,6 +310,16 @@ void dealloc_chorus_delay_lines(uint8_t bus) {
 
 void alloc_chorus_delay_lines(uint8_t bus) {
     amy_global.bus[bus]->chorus.delay_mod = (SAMPLE *)malloc_caps(sizeof(SAMPLE) * AMY_BLOCK_SIZE, amy_global.config.ram_caps_delay);
+    if (amy_global.bus[bus]->chorus.delay_mod == NULL) {
+        // FW-12: delay_mod was unchecked. render bzero's/renders into it every
+        // block while chorus level>0, so a NULL here is a use-of-NULL crash.
+        // Roll back like the delay-line failure path below (dealloc NULLs all
+        // pointers). The render site is additionally guarded on delay_mod so a
+        // subsequent config_chorus re-raising level can't crash on the NULL.
+        fprintf(stderr, "unable to alloc chorus delay_mod, chorus disabled\n");
+        dealloc_chorus_delay_lines(bus);
+        return;
+    }
     bool success = true;
     for(int c = 0; c < AMY_NCHANS; ++c) {
         delay_line_t *delay_line = new_delay_line(DELAY_LINE_LEN, DELAY_LINE_LEN / 2, amy_global.config.ram_caps_delay);
@@ -658,8 +668,7 @@ void amy_event_to_deltas_queue(amy_event *e, uint16_t base_osc, struct delta **q
         // volume_scale[] write on the audio task.
         d.osc = AMY_IS_SET(e->bus) ? e->bus : AMY_DEFAULT_BUS;
         if (d.osc >= AMY_NUM_BUSES) {
-            fprintf(stderr, "** bus out of range, clamping: %d
-", (int)d.osc);
+            fprintf(stderr, "** bus out of range, clamping: %d\n", (int)d.osc);
             d.osc = AMY_NUM_BUSES - 1;
         }
         bus_directed_command = true;
@@ -678,7 +687,11 @@ void amy_event_to_deltas_queue(amy_event *e, uint16_t base_osc, struct delta **q
         if (AMY_IS_SET(e->patch_number) || AMY_IS_SET(e->num_voices) || AMY_IS_SET(e->oscs_per_voice)) {
             amy_execute_deltas();
 #ifdef ESP_PLATFORM
-            amy_patch_loading = 1;   // FW-4: drain in-flight renders first
+            // FW-4: counted gate -- two concurrent loaders (MIDI program
+            // change + MP patch load) must both keep the gate raised until
+            // BOTH finish, else the first to finish drops it while the
+            // second still mutates synth[].
+            __atomic_fetch_add(&amy_patch_loading, 1, __ATOMIC_ACQ_REL);
             uint32_t _plb = amy_global.total_blocks;
             int _plg = 0;
             while (_plb != 0 && amy_global.total_blocks < _plb + 2 && _plg++ < 25)
@@ -686,7 +699,7 @@ void amy_event_to_deltas_queue(amy_event *e, uint16_t base_osc, struct delta **q
 #endif
             patches_load_patch(e);
 #ifdef ESP_PLATFORM
-            amy_patch_loading = 0;
+            __atomic_fetch_sub(&amy_patch_loading, 1, __ATOMIC_ACQ_REL);
 #endif
         }
         // Execute any other commands in this event.
@@ -709,8 +722,7 @@ void amy_event_to_deltas_queue(amy_event *e, uint16_t base_osc, struct delta **q
     // Everything else only added to queue if set
     if (!bus_directed_command) {
         if (AMY_IS_SET(e->bus) && e->bus >= AMY_NUM_BUSES) {
-            fprintf(stderr, "** bus out of range, clamping: %d
-", (int)e->bus);
+            fprintf(stderr, "** bus out of range, clamping: %d\n", (int)e->bus);
             e->bus = AMY_NUM_BUSES - 1;   // FW-1
         }
         EVENT_TO_DELTA_I(bus, BUS)
@@ -1918,7 +1930,7 @@ SAMPLE render_osc_wave(uint16_t osc, uint8_t core, SAMPLE* buf) {
 void amy_render(uint16_t start, uint16_t end, uint8_t core) {
     AMY_PROFILE_START(AMY_RENDER)
 #ifdef ESP_PLATFORM
-    extern volatile uint8_t amy_patch_loading;
+    extern volatile uint32_t amy_patch_loading;
     if (amy_patch_loading) {
         // FW-4: a patch load is mutating synth[]/msynth[] -- emit one
         // silent block instead of racing a realloc (patch loads glitch
@@ -1969,7 +1981,7 @@ void amy_render(uint16_t start, uint16_t end, uint8_t core) {
         for(int bus = 0; bus <= amy_global.highest_bus; ++bus) {
             ensure_osc_allocd(CHORUS_MOD_SOURCE + bus, NULL);
             hold_and_modify(CHORUS_MOD_SOURCE + bus);
-            if(amy_global.bus[bus]->chorus.level!=0)  {
+            if(amy_global.bus[bus]->chorus.level!=0 && amy_global.bus[bus]->chorus.delay_mod != NULL)  {  // FW-12: skip if delay_mod alloc failed
                 bzero(amy_global.bus[bus]->chorus.delay_mod, AMY_BLOCK_SIZE * sizeof(SAMPLE));
                 render_osc_wave(CHORUS_MOD_SOURCE + bus, 0 /* core */, amy_global.bus[bus]->chorus.delay_mod);
             }

@@ -249,18 +249,33 @@ bool init_stereo_reverb(reverb_params_t *rev) {
     // review O-6): they are read+written every sample and from PSRAM cost
     // ~640 cache misses per block (~1.8% of the fill core). ~64KB total;
     // falls back to the configured caps when internal is tight.
+    uint32_t fallback_caps = amy_global.config.ram_caps_delay;
 #ifdef ESP_PLATFORM
+    // O-6 residual: per-line internal-SRAM fallback. The heap-size pre-gate
+    // is only a fast path -- it checks the LARGEST free internal block once,
+    // but a race (concurrent internal-RAM allocation between check and
+    // alloc) or fragmentation can still fail line 3 of 4. So each main line
+    // tries INTERNAL first and, if that alloc returns NULL, retries from the
+    // configured caps before giving up, instead of failing reverb wholesale.
     uint32_t main_caps = MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT;
     if (heap_caps_get_largest_free_block(main_caps)
             < (DELAY_POW2 * (int)sizeof(SAMPLE) * 4 + 16384))
-        main_caps = amy_global.config.ram_caps_delay;
+        main_caps = fallback_caps;   // clearly too tight -- skip internal entirely
 #else
-    uint32_t main_caps = amy_global.config.ram_caps_delay;
+    uint32_t main_caps = fallback_caps;
 #endif
     rev->delay_1 = new_delay_line(DELAY_POW2, DELAY1SAMPS, main_caps);
+    if (rev->delay_1 == NULL && main_caps != fallback_caps)
+        rev->delay_1 = new_delay_line(DELAY_POW2, DELAY1SAMPS, fallback_caps);
     rev->delay_2 = new_delay_line(DELAY_POW2, DELAY2SAMPS, main_caps);
+    if (rev->delay_2 == NULL && main_caps != fallback_caps)
+        rev->delay_2 = new_delay_line(DELAY_POW2, DELAY2SAMPS, fallback_caps);
     rev->delay_3 = new_delay_line(DELAY_POW2, DELAY3SAMPS, main_caps);
+    if (rev->delay_3 == NULL && main_caps != fallback_caps)
+        rev->delay_3 = new_delay_line(DELAY_POW2, DELAY3SAMPS, fallback_caps);
     rev->delay_4 = new_delay_line(DELAY_POW2, DELAY4SAMPS, main_caps);
+    if (rev->delay_4 == NULL && main_caps != fallback_caps)
+        rev->delay_4 = new_delay_line(DELAY_POW2, DELAY4SAMPS, fallback_caps);
 
     rev->ref_1 = new_delay_line(4096, REF1SAMPS, amy_global.config.ram_caps_delay);
     rev->ref_2 = new_delay_line(2048, REF2SAMPS, amy_global.config.ram_caps_delay);
