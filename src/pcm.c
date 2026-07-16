@@ -360,9 +360,15 @@ SAMPLE render_pcm(SAMPLE* buf, uint16_t osc) {
         SAMPLE amp = F2S(msynth[osc]->amp);
         PHASOR step = F2P((playback_freq / (float)AMY_SAMPLE_RATE) / (float)(1 << PCM_INDEX_BITS));
         const LUTSAMPLE* table = preset->sample_ram;
-        uint32_t base_index = INT_OF_P(synth[osc]->phase, PCM_INDEX_BITS);
+        // Hoist the phase into a LOCAL for the block: synth[osc]->phase is a
+        // PSRAM pointer-chase that this loop used to read AND write EVERY
+        // sample -- the only renderer that didn't hoist (firmware review
+        // C-5, ~1-4% of a core under drum kits). Written back once below.
+        PHASOR phase = synth[osc]->phase;
+        uint8_t status_off = 0;
+        uint32_t base_index = INT_OF_P(phase, PCM_INDEX_BITS);
         for(uint16_t i=0; i < AMY_BLOCK_SIZE; i++) {
-            SAMPLE frac = S_FRAC_OF_P(synth[osc]->phase, PCM_INDEX_BITS);
+            SAMPLE frac = S_FRAC_OF_P(phase, PCM_INDEX_BITS);
             LUTSAMPLE b = 0;
             LUTSAMPLE c = 0;
             uint32_t next_index = base_index + 1;
@@ -399,13 +405,13 @@ SAMPLE render_pcm(SAMPLE* buf, uint16_t osc) {
                 c = (next_index < sample_length) ? table[next_index] : b;
             }
             SAMPLE sample = L2S(b) + MUL4_SS(L2S(c - b), frac);
-            synth[osc]->phase = P_WRAPPED_SUM(synth[osc]->phase, step);
-            base_index = INT_OF_P(synth[osc]->phase, PCM_INDEX_BITS);
+            phase = P_WRAPPED_SUM(phase, step);
+            base_index = INT_OF_P(phase, PCM_INDEX_BITS);
 
             if(preset->type != AMY_PCM_TYPE_FILE) {
                 // For non-file samples, we have to check for end of sample/looping.
                 if(base_index >= sample_length) { // end
-                    synth[osc]->status = SYNTH_OFF;// is this right?
+                    status_off = 1;
                     sample = 0;
                 } else {
                     if(msynth[osc]->feedback > 0) { // still looping.  The feedback flag is cleared by pcm_note_off.
@@ -417,7 +423,7 @@ SAMPLE render_pcm(SAMPLE* buf, uint16_t osc) {
                             // release on a one-shot).
                             int32_t loop_len = preset->loopend - preset->loopstart;
                             if(loop_len > 0 && (uint32_t)loop_len < preset->length) {
-                                synth[osc]->phase -= F2P(loop_len / (float)(1 << PCM_INDEX_BITS));
+                                phase -= F2P(loop_len / (float)(1 << PCM_INDEX_BITS));
                                 base_index -= loop_len;
                             }
                         }
@@ -425,13 +431,15 @@ SAMPLE render_pcm(SAMPLE* buf, uint16_t osc) {
                 }
             }
             SAMPLE value = buf[i] + MUL4_SS(amp, sample);
-            buf[i] = value;   
+            buf[i] = value;
             if (value < 0) value = -value;
-            if (value > max_value) max_value = value;  
+            if (value > max_value) max_value = value;
         }
+        synth[osc]->phase = phase;         // hoisted local written back once
+        if (status_off) synth[osc]->status = SYNTH_OFF;
         //printf("render_pcm: osc %d preset %d len %d base_ix %d phase %f step %f tablestep %f amp %f\n",
         //       osc, synth[osc]->preset, preset->length, base_index, P2F(synth[osc]->phase), P2F(step), (1 << PCM_INDEX_BITS) * P2F(step), S2F(msynth[osc]->amp));
-        return max_value; 
+        return max_value;
         // i don't believe we ever need to detect silence in a sample. it will shut itself off at the end.
     }
     return 0;

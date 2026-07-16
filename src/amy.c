@@ -2108,7 +2108,14 @@ int16_t * amy_fill_buffer() {
             SAMPLE fsample = 0;
             for (int bus = 0; bus <= sum_hi; ++bus) {
                 // Convert the mixed sample into the int16 range, applying overall gain.
-                fsample += MUL8_SS(volume_scale[bus], fbl[0][bus][i + c * AMY_BLOCK_SIZE]);
+                // Unity fast-path: MUL8_SS(F2S(1.0), x) is a precision-losing
+                // degenerate multiply (drops the low bits of every sample --
+                // ~13-bit effective output), and the aux-reverb fold sets
+                // volume_scale[0] to exactly 1.0 on the path the deck always
+                // uses (firmware review C-4).
+                SAMPLE v = fbl[0][bus][i + c * AMY_BLOCK_SIZE];
+                fsample += (volume_scale[bus] == F2S(1.0f))
+                           ? v : MUL8_SS(volume_scale[bus], v);
             }
 
             // One-pole high-pass filter to remove large low-frequency excursions from
