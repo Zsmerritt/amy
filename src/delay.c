@@ -355,6 +355,7 @@ void deinit_stereo_reverb(reverb_params_t *rev) {
 #define DL_READ(P)       (P##_s[(P##_n - P##_f) & P##_m])
 
 void stereo_reverb(reverb_params_t *rev, SAMPLE *r_in, SAMPLE *l_in, SAMPLE *r_out, SAMPLE *l_out, int n_samples, SAMPLE level) {
+    AMY_PROFILE_START(STEREO_REVERB_PASS)
     // Stereo reverb.  *{r,l}_in each point to n_samples input samples.
     // n_samples are written to {r,l}_out.
     // Recreate
@@ -457,9 +458,11 @@ void stereo_reverb(reverb_params_t *rev, SAMPLE *r_in, SAMPLE *l_in, SAMPLE *r_o
     rev->f2state = f2state;
     rev->f3state = f3state;
     rev->f4state = f4state;
+    AMY_PROFILE_STOP(STEREO_REVERB_PASS)
 }
 
 void stereo_reverb_wet(reverb_params_t *rev, SAMPLE *r_in, SAMPLE *l_in, SAMPLE *r_acc, SAMPLE *l_acc_out, int n_samples, SAMPLE level) {
+    AMY_PROFILE_START(STEREO_REVERB_PASS)
     // Same Stautner-Puckette network as stereo_reverb(), but an aux RETURN:
     // reads the send mix from {r,l}_in and ACCUMULATES only level*wet into
     // {r,l}_acc -- the dry signal is already in the master sum, so emitting
@@ -561,4 +564,5 @@ void stereo_reverb_wet(reverb_params_t *rev, SAMPLE *r_in, SAMPLE *l_in, SAMPLE 
     rev->f2state = f2state;
     rev->f3state = f3state;
     rev->f4state = f4state;
+    AMY_PROFILE_STOP(STEREO_REVERB_PASS)
 }

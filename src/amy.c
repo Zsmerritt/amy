@@ -38,6 +38,8 @@ const char* profile_tag_name(enum itags tag) {
         case BLOCK_NORM: return "BLOCK_NORM";
         case CALIBRATE: return "CALIBRATE";
         case AMY_ESP_FILL_BUFFER: return "AMY_ESP_FILL_BUFFER";
+        case STEREO_REVERB_PASS: return "STEREO_REVERB_PASS";
+        case AMY_FILL_POST: return "AMY_FILL_POST";
         case NO_TAG: return "NO_TAG";
    }
    return "ERROR";
@@ -2219,6 +2221,7 @@ int16_t * amy_fill_buffer() {
     }
     //    if (core_max[1] > max_val)  max_val = core_max[1];
     #endif
+    AMY_PROFILE_START(AMY_FILL_POST)
     // Apply global processing only if there is some signal.
     //if (max_val > 0) {      // NO - see #629
         // apply the eq filters if there is some signal and EQ is non-default.
@@ -2441,6 +2444,7 @@ int16_t * amy_fill_buffer() {
             }
         }
     }
+    AMY_PROFILE_STOP(AMY_FILL_POST)
 
     // Handle sampling after block is rendered
     if(amy_global.transfer_flag==AMY_TRANSFER_TYPE_SAMPLE) {
