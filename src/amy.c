@@ -49,12 +49,6 @@ uint64_t profile_start_us = 0;
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-// Patch-load render gate (review FW-4): patches_load_patch frees/reallocs
-// synth[] on the CALLER's task while the other core can be mid-render of
-// the same oscs -- a concrete use-after-free. Loaders raise this, wait a
-// bounded block-boundary handshake (same idiom as the flash fence), load,
-// drop. Renders emit silence while it is up.
-volatile uint32_t amy_patch_loading = 0;   // FW-4: counted gate (two concurrent loaders)
 int64_t amy_get_us() { return esp_timer_get_time(); }
 #elif defined PICO_ON_DEVICE
 int64_t amy_get_us() { return to_us_since_boot(get_absolute_time()); }
@@ -175,6 +169,13 @@ struct mod_synthinfo ** msynth;
 SAMPLE *fbl[AMY_MAX_CORES][AMY_NUM_BUSES];
 SAMPLE *per_osc_fb[AMY_MAX_CORES][AMY_NUM_BUSES];
 SAMPLE core_max[AMY_MAX_CORES];
+// Patch-load render gate (review FW-4): patches_load_patch frees/reallocs
+// synth[] on the CALLER's task while the other core can be mid-render of
+// the same oscs -- a concrete use-after-free. Loaders raise this counted
+// gate (only used under ESP_PLATFORM, but DEFINED unconditionally so every
+// target's linker sees it regardless of the ESP macro maze); renders emit
+// a silent block while it is nonzero.
+volatile uint32_t amy_patch_loading = 0;
 // Per-core bitmask of buses that received any osc mix this block (OPT-11).
 // fbl[core][bus] is cleared LAZILY on first use; a bus absent from both
 // cores' masks holds stale data and every consumer below must (and does)
