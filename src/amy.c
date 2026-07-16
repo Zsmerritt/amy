@@ -2004,9 +2004,15 @@ int16_t * amy_fill_buffer() {
                 }
             }
         }
-#ifndef AMY_MASTER_REVERB
+#if !defined(AMY_MASTER_REVERB) && !defined(AMY_AUX_REVERB)
         if(AMY_HAS_REVERB) {
-            // apply per-bus reverb.
+            // apply per-bus reverb. Compiled out under BOTH shared-room
+            // designs: with AMY_AUX_REVERB this block ALSO ran (the guard
+            // only excluded MASTER), so bus 0 was reverberated twice per
+            // frame through the SAME reverb state -- delay lines advancing
+            // at 2x, the wet self-interfering (audible crackle that scaled
+            // with reverb level), the dry re-emitted against the aux
+            // design's wet-only return, and a whole extra reverb of CPU.
             if(amy_global.bus[bus]->reverb.level > 0 && amy_global.bus[bus]->reverb.rev != NULL && amy_global.bus[bus]->reverb.rev->delay_1 != NULL) {
                 if(AMY_NCHANS == 1) {
                     stereo_reverb(amy_global.bus[bus]->reverb.rev, fbl[0][bus], NULL, fbl[0][bus], NULL, AMY_BLOCK_SIZE, amy_global.bus[bus]->reverb.level);
@@ -2015,7 +2021,7 @@ int16_t * amy_fill_buffer() {
                 }
             }
         }
-#endif  // !AMY_MASTER_REVERB
+#endif  // !AMY_MASTER_REVERB && !AMY_AUX_REVERB
     }  // end of per-bus FX
     // global volume is supposed to max out at 10, so scale by 0.1.
     SAMPLE volume_scale[AMY_NUM_BUSES];

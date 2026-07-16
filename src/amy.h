@@ -470,13 +470,16 @@ extern uint64_t profile_start_us;
     profiles[tag].us_total += (amy_get_us()-profiles[tag].start); \
     profiles[tag].calls++;
 
+// newlib-NANO (the ESP-IDF default libc) has no 64-bit printf support:
+// %llu / PRIu64 emit the literal letters ("luus" instead of the numbers).
+// Totals fit 32 bits for any practical profiling window; cast explicitly.
 #define AMY_PROFILE_PRINT(tag) \
     if(profiles[tag].calls) {\
-        fprintf(stderr,"%40s: %10"PRIu32" calls %10"PRIu64"us total [%6.2f%% wall %6.2f%% render] %9"PRIu64"us per call\n", \
-        profile_tag_name(tag), profiles[tag].calls, profiles[tag].us_total, \
+        fprintf(stderr,"%40s: %10lu calls %10luus total [%6.2f%% wall %6.2f%% render] %9luus per call\n", \
+        profile_tag_name(tag), (unsigned long)profiles[tag].calls, (unsigned long)profiles[tag].us_total, \
         ((float)(profiles[tag].us_total) / (float)(amy_get_us() - profile_start_us))*100.0, \
         ((float)(profiles[tag].us_total) / (float)(profiles[AMY_RENDER].us_total))*100.0, \
-        (profiles[tag].us_total)/profiles[tag].calls);\
+        (unsigned long)((profiles[tag].us_total)/profiles[tag].calls));\
     }
 
 extern struct profile profiles[NO_TAG];
