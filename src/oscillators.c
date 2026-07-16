@@ -875,6 +875,16 @@ SAMPLE render_wavetable(SAMPLE* buf, uint16_t osc) {
     if (wavetable_sample_ram == NULL || sample_length < (uint32_t)wavetable_samples_per_table) {
         return 0;
     }
+    // Flash fence (review FW-3): wavetable presets can resolve into the
+    // memory-mapped flash partitions, and this was the one renderer that
+    // fetched through the fence window unchecked -- the exact dual-core
+    // WDT crash render_pcm guards against (pcm.c). Hold phase, emit
+    // silence while a flash write is in flight.
+    if (amy_flash_fence
+        && (const void *)wavetable_sample_ram >= amy_flash_fence_lo
+        && (const void *)wavetable_sample_ram < amy_flash_fence_hi) {
+        return 0;
+    }
     LUT wavetable_lut = {wavetable_sample_ram, WAVETABLE_SAMPLES_PER_CYCLE, WAVETABLE_LOG2_SAMPLES_PER_CYCLE, 0, 1.0f};
     wavetable_lut.table += table * WAVETABLE_SAMPLES_PER_CYCLE;
     // don't update phase in the first call to render_lut, so second call uses the same phase

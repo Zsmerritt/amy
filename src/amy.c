@@ -47,6 +47,14 @@ uint64_t profile_start_us = 0;
 
 #ifdef ESP_PLATFORM
 #include "esp_timer.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+// Patch-load render gate (review FW-4): patches_load_patch frees/reallocs
+// synth[] on the CALLER's task while the other core can be mid-render of
+// the same oscs -- a concrete use-after-free. Loaders raise this, wait a
+// bounded block-boundary handshake (same idiom as the flash fence), load,
+// drop. Renders emit silence while it is up.
+volatile uint8_t amy_patch_loading = 0;
 int64_t amy_get_us() { return esp_timer_get_time(); }
 #elif defined PICO_ON_DEVICE
 int64_t amy_get_us() { return to_us_since_boot(get_absolute_time()); }
@@ -362,6 +370,10 @@ void config_chorus(uint8_t bus, float level, uint16_t max_delay, float lfo_freq,
 bool alloc_reverb_delay_lines(uint8_t bus) {
     if (amy_global.bus[bus]->reverb.rev == NULL)
         amy_global.bus[bus]->reverb.rev = new_reverb();
+    if (amy_global.bus[bus]->reverb.rev == NULL) {
+        fprintf(stderr, "reverb alloc failed; reverb disabled\n");  // FW-12
+        return false;
+    }
     return init_stereo_reverb(amy_global.bus[bus]->reverb.rev);
 }
 
@@ -548,6 +560,11 @@ float midi_note_for_logfreq(float logfreq) {
 
 void add_delta_to_queue(struct delta *d, struct delta **queue) {
     AMY_PROFILE_START(ADD_DELTA_TO_QUEUE)
+    // refill OUTSIDE the queue lock (FW-9): malloc under amy_queue_lock
+    // let a low-prio task's heap wait block the fill task (priority
+    // inversion through the heap lock). delta_get keeps its internal
+    // refill as a rare-race backstop.
+    if (free_deltas_pool == NULL) deltas_add_pool_block();
     amy_grab_lock();
 
     // hack.  Update the (decorative) global queue size if we're adding to the global queue.
@@ -555,6 +572,13 @@ void add_delta_to_queue(struct delta *d, struct delta **queue) {
         amy_global.delta_qsize++;
 
     struct delta *new_d = delta_get(d);
+    if (new_d == NULL) {          // pool capped: drop the event (FW-9)
+        if (queue == &amy_global.delta_queue)
+            amy_global.delta_qsize--;
+        amy_release_lock();
+        AMY_PROFILE_STOP(ADD_DELTA_TO_QUEUE)
+        return;
+    }
 
     // insert it into the sorted list for fast playback
     struct delta **pptr = queue;
@@ -625,7 +649,15 @@ void amy_event_to_deltas_queue(amy_event *e, uint16_t base_osc, struct delta **q
         || AMY_IS_SET(e->reverb_send)) {
         if (AMY_IS_SET(e->osc))  fprintf(stderr, "** osc %d specific for bus-directed command, ignoring\n", e->osc);  // Can't at this moment be more specific about which command.
         // Store the target bus in d.osc.
+        // CLAMP (review FW-1): the wire's 'y' param was never range-
+        // checked and flowed into bus[]/fbl[] indexing and a stack
+        // volume_scale[] write on the audio task.
         d.osc = AMY_IS_SET(e->bus) ? e->bus : AMY_DEFAULT_BUS;
+        if (d.osc >= AMY_NUM_BUSES) {
+            fprintf(stderr, "** bus %d out of range, clamping
+", (int)d.osc);
+            d.osc = AMY_NUM_BUSES - 1;
+        }
         bus_directed_command = true;
         if (d.osc > amy_global.highest_bus) amy_global.highest_bus = d.osc;
     } else {
@@ -641,7 +673,17 @@ void amy_event_to_deltas_queue(amy_event *e, uint16_t base_osc, struct delta **q
     if (AMY_IS_SET(e->voices[0]) || AMY_IS_SET(e->synth)) {
         if (AMY_IS_SET(e->patch_number) || AMY_IS_SET(e->num_voices) || AMY_IS_SET(e->oscs_per_voice)) {
             amy_execute_deltas();
+#ifdef ESP_PLATFORM
+            amy_patch_loading = 1;   // FW-4: drain in-flight renders first
+            uint32_t _plb = amy_global.total_blocks;
+            int _plg = 0;
+            while (_plb != 0 && amy_global.total_blocks < _plb + 2 && _plg++ < 25)
+                vTaskDelay(1);
+#endif
             patches_load_patch(e);
+#ifdef ESP_PLATFORM
+            amy_patch_loading = 0;
+#endif
         }
         // Execute any other commands in this event.
         patches_event_has_voices(e, queue);
@@ -662,6 +704,11 @@ void amy_event_to_deltas_queue(amy_event *e, uint16_t base_osc, struct delta **q
 
     // Everything else only added to queue if set
     if (!bus_directed_command) {
+        if (AMY_IS_SET(e->bus) && e->bus >= AMY_NUM_BUSES) {
+            fprintf(stderr, "** bus %d out of range, clamping
+", (int)e->bus);
+            e->bus = AMY_NUM_BUSES - 1;   // FW-1
+        }
         EVENT_TO_DELTA_I(bus, BUS)
         if (AMY_IS_SET(e->bus) && e->bus > amy_global.highest_bus)
             amy_global.highest_bus = e->bus;
@@ -1684,7 +1731,10 @@ void hold_and_modify(uint16_t osc) {
     // synth[osc]->feedback is copied to msynth in pcm_note_on, then used to track note-off for looping PCM.
     // For PCM, don't re-copy it every loop, or we'd lose track of that flag.  (This means you can't change feedback mid-playback for PCM).
     // we also check for custom, for tulips' memorypcm 
-    if (synth[osc]->wave != PCM && synth[osc]->wave != CUSTOM)  msynth[osc]->feedback = synth[osc]->feedback;
+    // PCM is a THREE-wave family (review FW-2): missing LEFT/RIGHT here
+    // re-copied feedback every block, undoing pcm_note_off's loop-stop
+    // -- a looping stereo sample could never be stopped.
+    if (!AMY_WAVE_IS_PCM(synth[osc]->wave) && synth[osc]->wave != CUSTOM)  msynth[osc]->feedback = synth[osc]->feedback;
     msynth[osc]->resonance = synth[osc]->resonance;
 
     if (osc == 999) {
@@ -1758,8 +1808,15 @@ SAMPLE render_osc_wave(uint16_t osc, uint8_t core, SAMPLE* buf) {
         //    osc, synth[osc]->render_clock);
     SAMPLE max_val = 0;
     // Only render if osc has not already been rendered this time step e.g. by chained_osc.
-    if (synth[osc]->render_clock != amy_global.total_samples) {
-        synth[osc]->render_clock = amy_global.total_samples;
+    // ATOMIC claim (review FW-6): a chain crossing the dual-core split let
+    // both cores pass the plain-read test and render the same osc twice in
+    // one block (2x phase advance + concurrently-written envelope state).
+    // Exactly one core wins the exchange; the loser adds nothing.
+    uint32_t expected = synth[osc]->render_clock;
+    if (expected != amy_global.total_samples
+        && __atomic_compare_exchange_n(&synth[osc]->render_clock, &expected,
+                                       amy_global.total_samples, false,
+                                       __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
         if (synth[osc]->amp_coefs[COEF_CONST] != 0) {
                     // fill buf with next block_size of samples for specified osc.
             hold_and_modify(osc); // apply bp / mod
@@ -1856,6 +1913,18 @@ SAMPLE render_osc_wave(uint16_t osc, uint8_t core, SAMPLE* buf) {
 
 void amy_render(uint16_t start, uint16_t end, uint8_t core) {
     AMY_PROFILE_START(AMY_RENDER)
+#ifdef ESP_PLATFORM
+    extern volatile uint8_t amy_patch_loading;
+    if (amy_patch_loading) {
+        // FW-4: a patch load is mutating synth[]/msynth[] -- emit one
+        // silent block instead of racing a realloc (patch loads glitch
+        // audibly anyway; a use-after-free crashes).
+        amy_bus_used[core] = 0;
+        core_max[core] = 0;
+        AMY_PROFILE_STOP(AMY_RENDER)
+        return;
+    }
+#endif
 
     // Buses are cleared LAZILY on first osc mix (OPT-11): the upfront
     // clear of every bus cost (highest_bus+1) x 2KB of writes per core
@@ -1865,6 +1934,7 @@ void amy_render(uint16_t start, uint16_t end, uint8_t core) {
     for(uint16_t osc=start; osc<end; osc++) {
         if(synth[osc] != NULL && synth[osc]->status == SYNTH_AUDIBLE) { // skip oscs that are silent or mod sources from playback
             uint8_t bus = synth[osc]->bus;
+            if (bus >= AMY_NUM_BUSES) bus = AMY_NUM_BUSES - 1;   // FW-1 belt
             if (!(used & (1u << bus))) {
                 used |= 1u << bus;
                 amy_block_zero(fbl[core][bus], AMY_BLOCK_SIZE * AMY_NCHANS);
@@ -2299,6 +2369,7 @@ int next_delta_block = 0;
 struct delta *deltas_pool_alloc(int max_delta_pool_size, struct delta *tail) {
     struct delta *new_pool = (struct delta *)malloc_caps(max_delta_pool_size * sizeof(struct delta),
                                                          amy_global.config.ram_caps_synth);
+    if (new_pool == NULL) return tail;   // OOM: keep the old pool (FW-12)
     struct delta *d = new_pool;
     // Link all the deltas together
     for (int i = 1; i < max_delta_pool_size; ++i) {
@@ -2316,15 +2387,25 @@ struct delta *deltas_pool_alloc(int max_delta_pool_size, struct delta *tail) {
 void deltas_add_pool_block(void) {
     //fprintf(stderr, "deltas_add_pool_block %d\n", next_delta_block);
     if (next_delta_block >= MAX_DELTA_BLOCKS) {
-        fprintf(stderr, "**PANIC: Ran out of deltas (%d blocks of %d deltas)\n", MAX_DELTA_BLOCKS, DELTA_BLOCK_SIZE);
-        abort();
+        // NO abort() (review FW-9): exhausting the pool mid-performance
+        // must DROP events (rate-limited log), not reboot the instrument.
+        static uint32_t warned = 0;
+        if ((warned++ & 0x3FF) == 0)
+            fprintf(stderr, "**deltas exhausted: dropping events\n");
+        return;
     }
-    free_deltas_pool = delta_blocks[next_delta_block++] = deltas_pool_alloc(DELTA_BLOCK_SIZE, free_deltas_pool);
+    struct delta *p = deltas_pool_alloc(DELTA_BLOCK_SIZE, free_deltas_pool);
+    if (p != free_deltas_pool) {
+        delta_blocks[next_delta_block++] = p;
+    }
+    free_deltas_pool = p;
 }
 
 void deltas_pool_init() {
     deltas_pool_free();
-    deltas_add_pool_block();
+    // Preallocate a performance-sized pool (FW-9): growing at runtime
+    // means a malloc on the event path; 4 blocks = 8192 deltas.
+    for (int i = 0; i < 4; i++) deltas_add_pool_block();
 }
 
 void deltas_pool_free() {
@@ -2341,6 +2422,7 @@ struct delta *delta_get(struct delta *from) {
     if (d == NULL)  {
         deltas_add_pool_block();
         d = free_deltas_pool;
+        if (d == NULL) return NULL;   // capped: caller drops (FW-9)
     }
     free_deltas_pool = d->next;
     if (from != NULL) {

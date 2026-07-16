@@ -66,7 +66,12 @@ void amy_event_midi_message_received(uint8_t * data, uint32_t len, uint8_t sysex
 #define MIDI_TASK_COREID (0)
 #define MIDI_TASK_STACK_SIZE (8 * 1024)
 #define MIDI_TASK_NAME      "amy_midi_task"
-#define MIDI_TASK_PRIORITY (ESP_TASK_PRIO_MAX - 2)
+// BELOW the render tasks (review FW-5): at MAX-2 a sysex burst preempted
+// core-0 rendering for its whole parse -- the fill task then blocked on
+// the render notify and the entire audio pipeline stalled past the DMA
+// ring. One block (5.8ms) of MIDI latency is inaudible; a stalled block
+// is not.
+#define MIDI_TASK_PRIORITY (ESP_TASK_PRIO_MAX - 4)
 #endif
 
 void run_midi();

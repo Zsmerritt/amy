@@ -199,6 +199,7 @@ void apply_fixed_delay(SAMPLE *block, delay_line_t *delay_line, uint32_t delay_s
 
 reverb_params_t *new_reverb() {
     reverb_params_t *rev = malloc_caps(sizeof(reverb_params_t), amy_global.config.ram_caps_synth);
+    if (rev == NULL) return NULL;   // caller disables reverb (review FW-12)
     bzero(rev, sizeof(reverb_params_t));
     return rev;
 }
@@ -244,10 +245,22 @@ bool init_stereo_reverb(reverb_params_t *rev) {
     if (rev->delay_1 != NULL)
         return true;  // already initialised
 
-    rev->delay_1 = new_delay_line(DELAY_POW2, DELAY1SAMPS, amy_global.config.ram_caps_delay);
-    rev->delay_2 = new_delay_line(DELAY_POW2, DELAY2SAMPS, amy_global.config.ram_caps_delay);
-    rev->delay_3 = new_delay_line(DELAY_POW2, DELAY3SAMPS, amy_global.config.ram_caps_delay);
-    rev->delay_4 = new_delay_line(DELAY_POW2, DELAY4SAMPS, amy_global.config.ram_caps_delay);
+    // The four MAIN tank lines prefer INTERNAL RAM (round-2 firmware
+    // review O-6): they are read+written every sample and from PSRAM cost
+    // ~640 cache misses per block (~1.8% of the fill core). ~64KB total;
+    // falls back to the configured caps when internal is tight.
+#ifdef ESP_PLATFORM
+    uint32_t main_caps = MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT;
+    if (heap_caps_get_largest_free_block(main_caps)
+            < (DELAY_POW2 * (int)sizeof(SAMPLE) * 4 + 16384))
+        main_caps = amy_global.config.ram_caps_delay;
+#else
+    uint32_t main_caps = amy_global.config.ram_caps_delay;
+#endif
+    rev->delay_1 = new_delay_line(DELAY_POW2, DELAY1SAMPS, main_caps);
+    rev->delay_2 = new_delay_line(DELAY_POW2, DELAY2SAMPS, main_caps);
+    rev->delay_3 = new_delay_line(DELAY_POW2, DELAY3SAMPS, main_caps);
+    rev->delay_4 = new_delay_line(DELAY_POW2, DELAY4SAMPS, main_caps);
 
     rev->ref_1 = new_delay_line(4096, REF1SAMPS, amy_global.config.ram_caps_delay);
     rev->ref_2 = new_delay_line(2048, REF2SAMPS, amy_global.config.ram_caps_delay);

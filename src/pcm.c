@@ -547,10 +547,16 @@ int16_t * pcm_load(uint16_t preset_number, uint32_t length, uint32_t samplerate,
     memory_preset->type = AMY_PCM_TYPE_MEMORY;
     memory_preset->sample_ram = (int16_t *)(((uint8_t *)memory_preset) + sizeof(memorypcm_preset_t));
     if(loopend == 0) {  // loop whole sample
-        memory_preset->loopend = memory_preset->length-1;
+        memory_preset->loopend = (length > 0) ? memory_preset->length-1 : 0;
     } else {
         memory_preset->loopend = loopend;
     }
+    // Clamp the loop window (review FW-13): loopstart >= loopend or
+    // loopend > length produced undefined phase math in pcm_note_off.
+    if (memory_preset->loopend >= length && length > 0)
+        memory_preset->loopend = length - 1;
+    if (memory_preset->loopstart >= memory_preset->loopend)
+        memory_preset->loopstart = 0;
     new_preset_pointer->preset = memory_preset;
     return memory_preset->sample_ram;
 }
