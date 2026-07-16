@@ -2,6 +2,7 @@
 // brian@variogr.am / dan.ellis@gmail.com
 
 #include "amy.h"
+#include "amy_blockops.h"
 #include "delay.h"
 
 #ifdef AMY_DEBUG
@@ -1066,8 +1067,10 @@ int8_t oscs_init() {
     // clear out both as local mode won't use fbl[1] 
     for(uint16_t core=0;core<AMY_CORES;++core) {
         for (int bus = 0; bus < AMY_NUM_BUSES; ++bus) {
-            per_osc_fb[core][bus] = (SAMPLE*)malloc_caps(sizeof(SAMPLE) * AMY_BLOCK_SIZE, amy_global.config.ram_caps_fbl);
-            fbl[core][bus] = (SAMPLE*)malloc_caps(sizeof(SAMPLE) * AMY_BLOCK_SIZE * AMY_NCHANS, amy_global.config.ram_caps_fbl);
+            // 16-byte aligned so amy_blockops.h's PIE vector paths engage
+            // for the per-block clears and the dual-core sum (OPT-4)
+            per_osc_fb[core][bus] = (SAMPLE*)malloc_caps_block(sizeof(SAMPLE) * AMY_BLOCK_SIZE, amy_global.config.ram_caps_fbl);
+            fbl[core][bus] = (SAMPLE*)malloc_caps_block(sizeof(SAMPLE) * AMY_BLOCK_SIZE * AMY_NCHANS, amy_global.config.ram_caps_fbl);
             bzero(fbl[core][bus], sizeof(SAMPLE) * AMY_BLOCK_SIZE * AMY_NCHANS);
         }
     }
@@ -1864,9 +1867,9 @@ void amy_render(uint16_t start, uint16_t end, uint8_t core) {
             uint8_t bus = synth[osc]->bus;
             if (!(used & (1u << bus))) {
                 used |= 1u << bus;
-                bzero(fbl[core][bus], sizeof(SAMPLE) * AMY_BLOCK_SIZE * AMY_NCHANS);
+                amy_block_zero(fbl[core][bus], AMY_BLOCK_SIZE * AMY_NCHANS);
             }
-            bzero(per_osc_fb[core][bus], AMY_BLOCK_SIZE * sizeof(SAMPLE));
+            amy_block_zero(per_osc_fb[core][bus], AMY_BLOCK_SIZE);
             SAMPLE max_val = render_osc_wave(osc, core, per_osc_fb[core][bus]);
             if (synth[osc]->status != SYNTH_AUDIBLE) {
                 reset_modosc(msynth[osc]);  // (g)  This makes a difference, but not clicks
@@ -2009,11 +2012,12 @@ int16_t * amy_fill_buffer() {
         uint32_t bit = 1u << bus;
         if (!(amy_bus_used[1] & bit)) continue;      // core 1 silent here
         if (bus_live & bit) {
-            for (int16_t i=0; i < AMY_BLOCK_SIZE * AMY_NCHANS; ++i)  fbl[0][bus][i] += fbl[1][bus][i];
+            // PIE 4-wide vector add on the S3 (OPT-4)
+            amy_block_add(fbl[0][bus], fbl[1][bus], AMY_BLOCK_SIZE * AMY_NCHANS);
         } else {
             // only core 1 played this bus: adopt its block instead of
             // adding into core 0's stale one
-            memcpy(fbl[0][bus], fbl[1][bus], sizeof(SAMPLE) * AMY_BLOCK_SIZE * AMY_NCHANS);
+            amy_block_copy(fbl[1][bus], fbl[0][bus], AMY_BLOCK_SIZE * AMY_NCHANS);
             bus_live |= bit;
         }
     }
@@ -2038,7 +2042,7 @@ int16_t * amy_fill_buffer() {
 #endif
                 ;
             if (!fx_active) continue;
-            bzero(fbl[0][bus], sizeof(SAMPLE) * AMY_BLOCK_SIZE * AMY_NCHANS);
+            amy_block_zero(fbl[0][bus], AMY_BLOCK_SIZE * AMY_NCHANS);
             bus_live |= bit;
         }
         // Per-bus EQ
