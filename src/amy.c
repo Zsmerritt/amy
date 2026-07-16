@@ -565,11 +565,10 @@ void deltas_add_pool_block(void);
 
 void add_delta_to_queue(struct delta *d, struct delta **queue) {
     AMY_PROFILE_START(ADD_DELTA_TO_QUEUE)
-    // refill OUTSIDE the queue lock (FW-9): malloc under amy_queue_lock
-    // let a low-prio task's heap wait block the fill task (priority
-    // inversion through the heap lock). delta_get keeps its internal
-    // refill as a rare-race backstop.
-    if (free_deltas_pool == NULL) deltas_add_pool_block();
+    // NOTE (FW-9 round 2): an unlocked refill pre-check here raced
+    // concurrent adders on the free list and was removed. The 4-block
+    // prealloc in deltas_pool_init makes the in-lock refill inside
+    // delta_get nearly unreachable (8192 deltas in flight).
     amy_grab_lock();
 
     // hack.  Update the (decorative) global queue size if we're adding to the global queue.
