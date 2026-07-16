@@ -1210,9 +1210,15 @@ extern SAMPLE scan_max(SAMPLE* block, int len);
 #define AMY_RENDER_TASK_PRIORITY (ESP_TASK_PRIO_MAX - 5)
 #define AMY_FILL_BUFFER_TASK_PRIORITY (ESP_TASK_PRIO_MAX - 5)
 #else
-// (ESP_TASK_PRIO_MAX - 1) is the highest available priority under FreeRTOS (at least in esp-idf 6.0).
-#define AMY_RENDER_TASK_PRIORITY (ESP_TASK_PRIO_MAX - 1)
-#define AMY_FILL_BUFFER_TASK_PRIORITY (ESP_TASK_PRIO_MAX - 1)
+// TWO below max, not one: at (MAX-1) these tied ESP-IDF's flash-guard IPC
+// task, so during a flash program/erase the guard could not reliably park
+// them -- an AMY task then touched cache-disabled address space and wedged
+// the chip (dual-core TG1WDT; flaky, worse when littlefs runs repair-erase
+// chains). At (MAX-3) the IPC task always preempts, the guard parks AMY for
+// the few ms of the write, and the I2S DMA ring absorbs the stall. Still
+// above every UI/app task, so audio keeps its priority over rendering.
+#define AMY_RENDER_TASK_PRIORITY (ESP_TASK_PRIO_MAX - 3)
+#define AMY_FILL_BUFFER_TASK_PRIORITY (ESP_TASK_PRIO_MAX - 3)
 #endif
 #define AMY_RENDER_TASK_COREID (0)
 #define AMY_FILL_BUFFER_TASK_COREID (1)
