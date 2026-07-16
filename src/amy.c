@@ -2155,7 +2155,7 @@ int16_t * amy_fill_buffer() {
             // Apply per-bus echo.
             if (amy_global.bus[bus]->echo.level > 0 && amy_global.bus[bus]->echo.echo_delay_lines[0] != NULL ) {
                 for (int16_t c=0; c < AMY_NCHANS; ++c) {
-                    apply_fixed_delay(fbl[0][bus] + c * AMY_BLOCK_SIZE, amy_global.bus[bus]->echo.echo_delay_lines[c], amy_global.bus[bus]->echo.delay_samples, amy_global.bus[bus]->echo.level, amy_global.bus[bus]->echo.feedback, amy_global.bus[bus]->echo.filter_coef);
+                    apply_fixed_delay(fbl[0][bus] + c * AMY_BLOCK_SIZE, amy_global.bus[bus]->echo.echo_delay_lines[c], amy_global.bus[bus]->echo.level, amy_global.bus[bus]->echo.feedback, amy_global.bus[bus]->echo.filter_coef);
                 }
             }
         }

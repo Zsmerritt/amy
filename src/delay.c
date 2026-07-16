@@ -147,10 +147,12 @@ static inline SAMPLE LPF(SAMPLE samp, SAMPLE *state, SAMPLE lpcoef, SAMPLE lpgai
     return SMULR6(SHIFTR(gain, 1), *state + SMULR6(lpgain, samp - *state));
 }
 
-void delay_line_in_out_fixed_delay(SAMPLE *in, SAMPLE *out, int n_samples, int delay_samples, delay_line_t *delay_line, SAMPLE mix_level, SAMPLE feedback_level, SAMPLE filter_coef) {
+void delay_line_in_out_fixed_delay(SAMPLE *in, SAMPLE *out, int n_samples, delay_line_t *delay_line, SAMPLE mix_level, SAMPLE feedback_level, SAMPLE filter_coef) {
     // Read and write the next n_samples from/to the delay line.
     // Simplified version of delay_line_in_out() that uses a fixed integer delay
-    // for the whole block.
+    // for the whole block.  The delay length is read from delay_line->fixed_delay
+    // via DEL_OUT (review C8: the old dead `delay_samples` arg was ignored here
+    // and only invited a future desync, so it was dropped).
     if (filter_coef == 0) {
         while(n_samples-- > 0) {
             SAMPLE delay_out = DEL_OUT(delay_line, 0);
@@ -189,8 +191,8 @@ void apply_variable_delay(SAMPLE *block, delay_line_t *delay_line, SAMPLE *delay
     delay_line_in_out(block, block, AMY_BLOCK_SIZE, delay_mod, delay_scale, delay_line, mix_level, feedback_level);
 }
 
-void apply_fixed_delay(SAMPLE *block, delay_line_t *delay_line, uint32_t delay_samples, SAMPLE mix_level, SAMPLE feedback, SAMPLE filter_coef) {
-    delay_line_in_out_fixed_delay(block, block, AMY_BLOCK_SIZE, delay_samples, delay_line, mix_level, feedback, filter_coef);
+void apply_fixed_delay(SAMPLE *block, delay_line_t *delay_line, SAMPLE mix_level, SAMPLE feedback, SAMPLE filter_coef) {
+    delay_line_in_out_fixed_delay(block, block, AMY_BLOCK_SIZE, delay_line, mix_level, feedback, filter_coef);
 }
 
 #define INITIAL_XOVER_HZ 3000.0
@@ -297,18 +299,22 @@ bool init_stereo_reverb(reverb_params_t *rev) {
 }
 
 void deinit_stereo_reverb(reverb_params_t *rev) {
-    if (rev->delay_1 != NULL) {
-        free(rev->delay_1); rev->delay_1 = NULL;
-        free(rev->delay_2); rev->delay_2 = NULL;
-        free(rev->delay_3); rev->delay_3 = NULL;
-        free(rev->delay_4); rev->delay_4 = NULL;
-        free(rev->ref_1); rev->ref_1 = NULL;
-        free(rev->ref_2); rev->ref_2 = NULL;
-        free(rev->ref_3); rev->ref_3 = NULL;
-        free(rev->ref_4); rev->ref_4 = NULL;
-        free(rev->ref_5); rev->ref_5 = NULL;
-        free(rev->ref_6); rev->ref_6 = NULL;
-    }
+    // Free EACH line independently (review C1): the old outer
+    // `if (rev->delay_1 != NULL)` guard meant a partial init where delay_1
+    // itself was the failed alloc (delay_2..4/ref_1..6 succeeded) freed and
+    // NULLed nothing -- orphaning ~50KB, and a later reconfigure re-entered
+    // init (delay_1 still NULL) and overwrote the survivors, leaking again.
+    // free(NULL) is a safe no-op, so a per-pointer guard is all that's needed.
+    if (rev->delay_1) { free(rev->delay_1); rev->delay_1 = NULL; }
+    if (rev->delay_2) { free(rev->delay_2); rev->delay_2 = NULL; }
+    if (rev->delay_3) { free(rev->delay_3); rev->delay_3 = NULL; }
+    if (rev->delay_4) { free(rev->delay_4); rev->delay_4 = NULL; }
+    if (rev->ref_1) { free(rev->ref_1); rev->ref_1 = NULL; }
+    if (rev->ref_2) { free(rev->ref_2); rev->ref_2 = NULL; }
+    if (rev->ref_3) { free(rev->ref_3); rev->ref_3 = NULL; }
+    if (rev->ref_4) { free(rev->ref_4); rev->ref_4 = NULL; }
+    if (rev->ref_5) { free(rev->ref_5); rev->ref_5 = NULL; }
+    if (rev->ref_6) { free(rev->ref_6); rev->ref_6 = NULL; }
 }
 
 // Cache one delay line's state in locals for the reverb loop, the same way

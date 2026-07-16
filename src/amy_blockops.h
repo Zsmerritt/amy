@@ -4,6 +4,13 @@
 // 16-byte-aligned pointers and sizes, scalar/libc fallback otherwise, so
 // callers never need their own alignment guarantees. fbl/per_osc_fb are
 // allocated with malloc_caps_block so the guards pass in practice.
+//
+// LATENT HARDWARE-LOOP CONTRACT (review C5): each `loopnez` below writes the
+// zero-overhead-loop registers (LBEG/LEND/LCOUNT) and the `q` vector registers
+// are clobbered -- neither is declarable in the asm constraint lists. Do NOT
+// call these ops from within a C loop the compiler may lower to a hardware
+// `loop`: the inner loopnez would corrupt the outer loop's LBEG/LEND/LCOUNT.
+// Callers must invoke these at whole-block granularity only.
 #ifndef __AMY_BLOCKOPS_H
 #define __AMY_BLOCKOPS_H
 

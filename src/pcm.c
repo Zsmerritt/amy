@@ -246,7 +246,14 @@ void pcm_note_on(uint16_t osc) {
                     preset->log2sr = log2f((float)info.sample_rate / ZERO_LOGFREQ_IN_HZ);
                     preset->file_bytes_remaining = data_bytes;
                 } else {
+                    // Re-parse failed (review C7): close AND clear the handle,
+                    // then force the voice off. The old code left file_handle
+                    // non-zero on a now-closed handle, so the next render_pcm
+                    // issued fseek/read on it. Zeroing file_handle + marking the
+                    // voice off mirrors render_pcm's own sample_ram==NULL bail.
                     amy_global.config.amy_external_fclose_hook(preset->file_handle);
+                    preset->file_handle = 0;
+                    synth[osc]->status = SYNTH_OFF;
                 }
             }
         } else if (preset->type == AMY_PCM_TYPE_ROM) {
@@ -389,13 +396,18 @@ SAMPLE render_pcm(SAMPLE* buf, uint16_t osc) {
                     b = table[base_offset + 1];
                     c = (next_index < sample_length) ? table[next_offset + 1] : b;
                 } else { // PCM or PCM_MIX
+                    // >> 1 instead of / 2 (review C4): signed int32 operands, so
+                    // the shift floors toward -inf where / 2 truncated toward 0
+                    // -- a 1-LSB rounding-direction change on negative sums,
+                    // acceptable per the review, and it drops the per-sample
+                    // integer divide on the drum-kit hot path.
                     LUTSAMPLE bl = table[base_offset];
                     LUTSAMPLE br = table[base_offset + 1];
-                    b = (LUTSAMPLE)(((int32_t)bl + (int32_t)br) / 2);
+                    b = (LUTSAMPLE)(((int32_t)bl + (int32_t)br) >> 1);
                     if (next_index < sample_length) {
                         LUTSAMPLE cl = table[next_offset];
                         LUTSAMPLE cr = table[next_offset + 1];
-                        c = (LUTSAMPLE)(((int32_t)cl + (int32_t)cr) / 2);
+                        c = (LUTSAMPLE)(((int32_t)cl + (int32_t)cr) >> 1);
                     } else {
                         c = b;
                     }
