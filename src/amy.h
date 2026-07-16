@@ -120,6 +120,11 @@ extern volatile uint8_t amy_flash_fence;
 extern const void *amy_flash_fence_lo;
 extern const void *amy_flash_fence_hi;
 
+// Runtime partial-detail knob for the interp-partials (piano) engine
+// (see interp_partials.c): harmonics at/above this index are dropped.
+// Change only while no partials notes are held.
+extern uint8_t amy_partials_harmonic_limit;
+
 // Oscs below this floor are never auto-allocated to patch voices -- for hosts
 // that drive low-numbered oscs directly alongside the patch/instrument layer.
 extern uint16_t amy_reserved_oscs;
