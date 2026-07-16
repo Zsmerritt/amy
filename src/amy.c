@@ -166,6 +166,12 @@ struct mod_synthinfo ** msynth;
 SAMPLE *fbl[AMY_MAX_CORES][AMY_NUM_BUSES];
 SAMPLE *per_osc_fb[AMY_MAX_CORES][AMY_NUM_BUSES];
 SAMPLE core_max[AMY_MAX_CORES];
+// Per-core bitmask of buses that received any osc mix this block (OPT-11).
+// fbl[core][bus] is cleared LAZILY on first use; a bus absent from both
+// cores' masks holds stale data and every consumer below must (and does)
+// treat it as silent. Buses with live FX tails get re-marked with a zeroed
+// block in the FX pass so chorus/echo/EQ state keeps advancing.
+uint32_t amy_bus_used[AMY_MAX_CORES];
 
 // Public pointer to recently-emitted waveform block.
 output_sample_type * amy_out_block = NULL;
@@ -366,8 +372,12 @@ void dealloc_reverb_delay_lines(uint8_t bus) {
 }
 
 void config_reverb(uint8_t bus, float level, float liveness, float damping, float xover_hz) {
-#ifdef AMY_MASTER_REVERB
-    bus = 0;   // one shared room: reverb config always lands on the master slot
+#if defined(AMY_MASTER_REVERB) || defined(AMY_AUX_REVERB)
+    // one shared room: reverb config always lands on the master slot. Under
+    // AUX too -- a patch string carrying baked 'h' params on a non-zero bus
+    // would otherwise allocate a stray second reverb (~108KB PSRAM) that
+    // the aux model never mixes correctly.
+    bus = 0;
 #endif
     if (AMY_IS_UNSET(level)) level = S2F(amy_global.bus[bus]->reverb.level);
     if (AMY_IS_UNSET(liveness)) liveness = amy_global.bus[bus]->reverb.liveness;
@@ -441,7 +451,14 @@ void bus_reset(uint8_t bus) {
     reset_parametric(bus);
 
     if (AMY_HAS_CHORUS) config_chorus(bus, CHORUS_DEFAULT_LEVEL, CHORUS_DEFAULT_MAX_DELAY, CHORUS_DEFAULT_LFO_FREQ, CHORUS_DEFAULT_MOD_DEPTH);
+#ifdef AMY_AUX_REVERB
+    // New buses default DRY: 1.0 made any bus the router hadn't explicitly
+    // configured send full-wet into the shared room (E-3 bonus). Deck
+    // policy is dry-matches-the-patch; the router raises sends it manages.
+    amy_global.bus[bus]->reverb_send = 0.0f;
+#else
     amy_global.bus[bus]->reverb_send = 1.0f;  // aux-send spike: 1.0 == master-room behavior
+#endif
     if (AMY_HAS_REVERB) config_reverb(bus, REVERB_DEFAULT_LEVEL, REVERB_DEFAULT_LIVENESS, REVERB_DEFAULT_DAMPING, REVERB_DEFAULT_XOVER_HZ);
     if (AMY_HAS_ECHO)   config_echo(bus, S2F(ECHO_DEFAULT_LEVEL), ECHO_DEFAULT_DELAY_MS, ECHO_DEFAULT_MAX_DELAY_MS, S2F(ECHO_DEFAULT_FEEDBACK), S2F(ECHO_DEFAULT_FILTER_COEF));
 }
@@ -1699,12 +1716,23 @@ void mix_with_pan(SAMPLE *stereo_dest, SAMPLE *mono_src, float pan_start, float 
     if(AMY_NCHANS==1) {
         // actually dest is mono, pan is ignored.
         for(uint16_t i=0;i<AMY_BLOCK_SIZE;i++) { stereo_dest[i] += mono_src[i]; }
-    } else { 
-        // stereo
+    } else if (pan_start == pan_end) {
+        // static pan -- the overwhelmingly common case (OPT-7): 2 software
+        // sqrts instead of 6 and no per-sample ramp adds. A 25-osc piano
+        // voice was paying ~100 sqrts per block for pans that never move.
         SAMPLE gain_l = F2S(lgain_of_pan(pan_start));
         SAMPLE gain_r = F2S(rgain_of_pan(pan_start));
-        SAMPLE d_gain_l = F2S((lgain_of_pan(pan_end) - lgain_of_pan(pan_start)) / AMY_BLOCK_SIZE);
-        SAMPLE d_gain_r = F2S((rgain_of_pan(pan_end) - rgain_of_pan(pan_start)) / AMY_BLOCK_SIZE);
+        for(uint16_t i=0;i<AMY_BLOCK_SIZE;i++) {
+            stereo_dest[i] += MUL8_SS(gain_l, mono_src[i]);
+            stereo_dest[AMY_BLOCK_SIZE + i] += MUL8_SS(gain_r, mono_src[i]);
+        }
+    } else {
+        // stereo, pan ramping across the block
+        float lg0 = lgain_of_pan(pan_start), rg0 = rgain_of_pan(pan_start);
+        SAMPLE gain_l = F2S(lg0);
+        SAMPLE gain_r = F2S(rg0);
+        SAMPLE d_gain_l = F2S((lgain_of_pan(pan_end) - lg0) / AMY_BLOCK_SIZE);
+        SAMPLE d_gain_r = F2S((rgain_of_pan(pan_end) - rg0) / AMY_BLOCK_SIZE);
         for(uint16_t i=0;i<AMY_BLOCK_SIZE;i++) {
             stereo_dest[i] += MUL8_SS(gain_l, mono_src[i]);
             stereo_dest[AMY_BLOCK_SIZE + i] += MUL8_SS(gain_r, mono_src[i]);
@@ -1826,12 +1854,18 @@ SAMPLE render_osc_wave(uint16_t osc, uint8_t core, SAMPLE* buf) {
 void amy_render(uint16_t start, uint16_t end, uint8_t core) {
     AMY_PROFILE_START(AMY_RENDER)
 
-    for(int bus = 0; bus <= amy_global.highest_bus; ++bus)
-        bzero(fbl[core][bus], sizeof(SAMPLE) * AMY_BLOCK_SIZE * AMY_NCHANS); 
+    // Buses are cleared LAZILY on first osc mix (OPT-11): the upfront
+    // clear of every bus cost (highest_bus+1) x 2KB of writes per core
+    // per block whether or not anything played into them.
+    uint32_t used = 0;
     SAMPLE max_max = 0;
     for(uint16_t osc=start; osc<end; osc++) {
         if(synth[osc] != NULL && synth[osc]->status == SYNTH_AUDIBLE) { // skip oscs that are silent or mod sources from playback
             uint8_t bus = synth[osc]->bus;
+            if (!(used & (1u << bus))) {
+                used |= 1u << bus;
+                bzero(fbl[core][bus], sizeof(SAMPLE) * AMY_BLOCK_SIZE * AMY_NCHANS);
+            }
             bzero(per_osc_fb[core][bus], AMY_BLOCK_SIZE * sizeof(SAMPLE));
             SAMPLE max_val = render_osc_wave(osc, core, per_osc_fb[core][bus]);
             if (synth[osc]->status != SYNTH_AUDIBLE) {
@@ -1852,6 +1886,7 @@ void amy_render(uint16_t start, uint16_t end, uint8_t core) {
         } // end if audible
     }
     core_max[core] = max_max;
+    amy_bus_used[core] = used;
 
     if(AMY_HAS_CHORUS && core == 0) {
         for(int bus = 0; bus <= amy_global.highest_bus; ++bus) {
@@ -1866,7 +1901,7 @@ void amy_render(uint16_t start, uint16_t end, uint8_t core) {
 
     if (amy_global.debug_flag) {
         amy_global.debug_flag = 0;  // Only do this once each time debug_flag is set.
-        SAMPLE smax = scan_max(fbl[core][0 /* bus */], AMY_BLOCK_SIZE);
+        SAMPLE smax = (used & 1u) ? scan_max(fbl[core][0 /* bus */], AMY_BLOCK_SIZE) : 0;
         fprintf(stderr, "time %" PRIu32 " core %d bus 0 max_max=%.3f post-eq max=%.3f\n", amy_global.total_samples, core, S2F(max_max), S2F(smax));
     }
 
@@ -1966,17 +2001,46 @@ int16_t * amy_fill_buffer() {
     if (output_block == output_block_0)  output_block = output_block_1;
     else output_block = output_block_0;
 
-    // mix results from both cores.
-    //SAMPLE max_val = core_max[0];
+    // mix results from both cores. Mask-aware (OPT-11): a bus neither core
+    // played into is stale garbage and every stage below skips it.
+    uint32_t bus_live = amy_bus_used[0];
     #ifdef AMY_DUALCORE
-    for (int bus = 0; bus <= amy_global.highest_bus; ++bus)
-        for (int16_t i=0; i < AMY_BLOCK_SIZE * AMY_NCHANS; ++i)  fbl[0][bus][i] += fbl[1][bus][i];
+    for (int bus = 0; bus <= amy_global.highest_bus; ++bus) {
+        uint32_t bit = 1u << bus;
+        if (!(amy_bus_used[1] & bit)) continue;      // core 1 silent here
+        if (bus_live & bit) {
+            for (int16_t i=0; i < AMY_BLOCK_SIZE * AMY_NCHANS; ++i)  fbl[0][bus][i] += fbl[1][bus][i];
+        } else {
+            // only core 1 played this bus: adopt its block instead of
+            // adding into core 0's stale one
+            memcpy(fbl[0][bus], fbl[1][bus], sizeof(SAMPLE) * AMY_BLOCK_SIZE * AMY_NCHANS);
+            bus_live |= bit;
+        }
+    }
     //    if (core_max[1] > max_val)  max_val = core_max[1];
     #endif
     // Apply global processing only if there is some signal.
     //if (max_val > 0) {      // NO - see #629
         // apply the eq filters if there is some signal and EQ is non-default.
     for (int bus=0; bus <= amy_global.highest_bus; ++bus) {
+        uint32_t bit = 1u << bus;
+        if (!(bus_live & bit)) {
+            // No oscs played this bus. FX with STATE (chorus/echo delay
+            // lines, EQ biquads, per-bus reverb) still carry an audible
+            // tail and must keep advancing over a zero block; a bus with
+            // no active FX is skipped outright (OPT-11).
+            uint8_t fx_active =
+                (amy_global.bus[bus]->eq.eq[0] != F2S(1.0f) || amy_global.bus[bus]->eq.eq[1] != F2S(1.0f) || amy_global.bus[bus]->eq.eq[2] != F2S(1.0f))
+                || (AMY_HAS_CHORUS && amy_global.bus[bus]->chorus.level > 0 && amy_global.bus[bus]->chorus.chorus_delay_lines[0] != NULL)
+                || (AMY_HAS_ECHO && amy_global.bus[bus]->echo.level > 0 && amy_global.bus[bus]->echo.echo_delay_lines[0] != NULL)
+#if !defined(AMY_MASTER_REVERB) && !defined(AMY_AUX_REVERB)
+                || (AMY_HAS_REVERB && amy_global.bus[bus]->reverb.level > 0 && amy_global.bus[bus]->reverb.rev != NULL)
+#endif
+                ;
+            if (!fx_active) continue;
+            bzero(fbl[0][bus], sizeof(SAMPLE) * AMY_BLOCK_SIZE * AMY_NCHANS);
+            bus_live |= bit;
+        }
         // Per-bus EQ
         if (amy_global.bus[bus]->eq.eq[0] != F2S(1.0f) || amy_global.bus[bus]->eq.eq[1] != F2S(1.0f) || amy_global.bus[bus]->eq.eq[2] != F2S(1.0f)) {
             parametric_eq_process(bus, fbl[0][bus]);
@@ -2045,6 +2109,7 @@ int16_t * amy_fill_buffer() {
                 int idx = i + c * AMY_BLOCK_SIZE;
                 SAMPLE dry = 0, snd = 0;
                 for (int bus = 0; bus <= amy_global.highest_bus; ++bus) {
+                    if (!(bus_live & (1u << bus))) continue;  // stale = silent
                     SAMPLE v = fbl[0][bus][idx];
                     dry += MUL8_SS(volume_scale[bus], v);
                     snd += MUL8_SS(send_scale[bus], v);
@@ -2053,6 +2118,7 @@ int16_t * amy_fill_buffer() {
                 aux[idx] = snd;
             }
         }
+        bus_live |= 1u;             // the fold just wrote bus 0
         // Aux return: the wet-only variant ACCUMULATES level*wet straight
         // into the master block; the send's dry never re-enters the mix.
         if (AMY_NCHANS == 1) {
@@ -2083,11 +2149,14 @@ int16_t * amy_fill_buffer() {
             for (int16_t i = 0; i < AMY_BLOCK_SIZE; ++i) {
                 int idx = i + c * AMY_BLOCK_SIZE;
                 SAMPLE s = 0;
-                for (int bus = 0; bus <= amy_global.highest_bus; ++bus)
+                for (int bus = 0; bus <= amy_global.highest_bus; ++bus) {
+                    if (!(bus_live & (1u << bus))) continue;  // stale = silent
                     s += MUL8_SS(volume_scale[bus], fbl[0][bus][idx]);
+                }
                 fbl[0][0][idx] = s;
             }
         }
+        bus_live |= 1u;             // the fold just wrote bus 0
         if (AMY_NCHANS == 1) {
             stereo_reverb(amy_global.bus[0]->reverb.rev, fbl[0][0], NULL,
                           fbl[0][0], NULL, AMY_BLOCK_SIZE,
@@ -2107,6 +2176,7 @@ int16_t * amy_fill_buffer() {
 
             SAMPLE fsample = 0;
             for (int bus = 0; bus <= sum_hi; ++bus) {
+                if (!(bus_live & (1u << bus))) continue;      // stale = silent
                 // Convert the mixed sample into the int16 range, applying overall gain.
                 // Unity fast-path: MUL8_SS(F2S(1.0), x) is a precision-losing
                 // degenerate multiply (drops the low bits of every sample --
