@@ -879,12 +879,16 @@ SAMPLE render_wavetable(SAMPLE* buf, uint16_t osc) {
     // memory-mapped flash partitions, and this was the one renderer that
     // fetched through the fence window unchecked -- the exact dual-core
     // WDT crash render_pcm guards against (pcm.c). Hold phase, emit
-    // silence while a flash write is in flight.
+    // silence while a flash write is in flight. GAMMA9001-only: the fence
+    // symbols (and the mmap'd-flash window they describe) exist only on
+    // that build -- desktop/web link everything into RAM (amy.h:118).
+#ifdef GAMMA9001
     if (amy_flash_fence
         && (const void *)wavetable_sample_ram >= amy_flash_fence_lo
         && (const void *)wavetable_sample_ram < amy_flash_fence_hi) {
         return 0;
     }
+#endif
     LUT wavetable_lut = {wavetable_sample_ram, WAVETABLE_SAMPLES_PER_CYCLE, WAVETABLE_LOG2_SAMPLES_PER_CYCLE, 0, 1.0f};
     wavetable_lut.table += table * WAVETABLE_SAMPLES_PER_CYCLE;
     // don't update phase in the first call to render_lut, so second call uses the same phase
