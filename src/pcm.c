@@ -36,6 +36,20 @@ typedef struct memorypcm_ll_t{
     uint16_t preset_number;
 } memorypcm_ll_t;
 
+// FLASH FENCE: on platforms that serve PCM banks straight from memory-mapped
+// flash (ESP32-S3 partitions), a flash program/erase suspends the cache those
+// reads go through while the render task keeps running (code and rodata live
+// in PSRAM on a separate bus) -- one sample fetch during the write window
+// hard-crashes the chip (dual-core interrupt WDT). The platform sets
+// [lo, hi) to its flash-mapped address window and raises amy_flash_fence
+// around every filesystem write; fenced renders skip the fetch and emit
+// silence for those oscs (phase held, so the voice resumes afterwards).
+// Everything not in the window -- computed voices, PSRAM-loaded banks --
+// renders on undisturbed.
+volatile uint8_t amy_flash_fence = 0;
+const void *amy_flash_fence_lo = 0;
+const void *amy_flash_fence_hi = 0;
+
 
 memorypcm_ll_t * memorypcm_ll_start;
 
@@ -332,6 +346,14 @@ SAMPLE render_pcm(SAMPLE* buf, uint16_t osc) {
         }
         if (preset->sample_ram == NULL || sample_length == 0) {
             synth[osc]->status = SYNTH_OFF;
+            return 0;
+        }
+        if (amy_flash_fence
+            && (const void *)preset->sample_ram >= amy_flash_fence_lo
+            && (const void *)preset->sample_ram < amy_flash_fence_hi) {
+            // A flash write is in progress and this sample lives in mapped
+            // flash: fetching it now would fault (cache suspended). Emit
+            // silence, hold the phase; the voice resumes when the fence drops.
             return 0;
         }
 

@@ -112,6 +112,14 @@ extern void amy_set_gamma9001_pcm(const int16_t * data);
 extern void amy_set_gm_pcm(const int16_t * data);
 extern void amy_set_gm_big_pcm(const int16_t * data);
 
+// Flash fence (see pcm.c): platform sets [lo, hi) to its memory-mapped flash
+// window and raises the fence around filesystem writes; PCM renders whose
+// samples live in the window emit silence (phase held) while it is up, so a
+// flash program/erase can never race a mapped sample fetch.
+extern volatile uint8_t amy_flash_fence;
+extern const void *amy_flash_fence_lo;
+extern const void *amy_flash_fence_hi;
+
 // Oscs below this floor are never auto-allocated to patch voices -- for hosts
 // that drive low-numbered oscs directly alongside the patch/instrument layer.
 extern uint16_t amy_reserved_oscs;
