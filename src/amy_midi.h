@@ -52,8 +52,11 @@ extern uint16_t sysex_len;
 extern void parse_sysex();
 extern uint8_t last_midi[MIDI_QUEUE_DEPTH][MAX_MIDI_BYTES_PER_MESSAGE];
 extern uint8_t last_midi_len[MIDI_QUEUE_DEPTH];
-extern int16_t midi_queue_tail;
-extern int16_t midi_queue_head;
+// volatile: SPSC ring shared across cores (writer = MIDI task, reader =
+// the host MP task); the defining declarations on Tulip are volatile and
+// these must agree or the build fails on conflicting qualifiers
+extern volatile int16_t midi_queue_tail;
+extern volatile int16_t midi_queue_head;
 
 void midi_out(uint8_t * bytes, uint16_t len);
 void midi_local(uint8_t * bytes, uint16_t len);

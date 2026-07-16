@@ -558,6 +558,11 @@ float midi_note_for_logfreq(float logfreq) {
 
 
 
+// defined with the delta pool at the bottom of this file; the FW-9
+// refill pre-check below runs before those definitions appear
+extern struct delta *free_deltas_pool;
+void deltas_add_pool_block(void);
+
 void add_delta_to_queue(struct delta *d, struct delta **queue) {
     AMY_PROFILE_START(ADD_DELTA_TO_QUEUE)
     // refill OUTSIDE the queue lock (FW-9): malloc under amy_queue_lock
@@ -654,7 +659,7 @@ void amy_event_to_deltas_queue(amy_event *e, uint16_t base_osc, struct delta **q
         // volume_scale[] write on the audio task.
         d.osc = AMY_IS_SET(e->bus) ? e->bus : AMY_DEFAULT_BUS;
         if (d.osc >= AMY_NUM_BUSES) {
-            fprintf(stderr, "** bus %d out of range, clamping
+            fprintf(stderr, "** bus out of range, clamping: %d
 ", (int)d.osc);
             d.osc = AMY_NUM_BUSES - 1;
         }
@@ -705,7 +710,7 @@ void amy_event_to_deltas_queue(amy_event *e, uint16_t base_osc, struct delta **q
     // Everything else only added to queue if set
     if (!bus_directed_command) {
         if (AMY_IS_SET(e->bus) && e->bus >= AMY_NUM_BUSES) {
-            fprintf(stderr, "** bus %d out of range, clamping
+            fprintf(stderr, "** bus out of range, clamping: %d
 ", (int)e->bus);
             e->bus = AMY_NUM_BUSES - 1;   // FW-1
         }
