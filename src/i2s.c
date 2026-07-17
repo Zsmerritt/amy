@@ -257,11 +257,131 @@ TaskHandle_t amy_update_handle = NULL;
 // Who esp_render_task tells that it is done.
 TaskHandle_t amy_render_task_done_handle = NULL;
 
+// ---------------------------------------------------------------------------
+// OPT-9 core-split probe: per-core cycle cost of amy_render() per block.
+//
+// The osc split across the two cores is STATIC (AMY_OSCS/2): esp_render_task
+// (pinned core 0, which also runs Tulip's display) renders oscs [0, N/2);
+// esp_render_on_cores' caller (fill-buffer task, pinned core 1) renders
+// [N/2, N).  Voices allocate from LOW osc numbers, so core 0 fills up first
+// while core 1 may idle.  These counters measure that imbalance on-device:
+// CCOUNT (cycle counter, one per core) is read right around each core's
+// amy_render() call and the worst (max) per-block delta is kept per core,
+// plus the most recent block's delta.  Read/reset from MicroPython via
+// tulip.render_cyc() (tulipcc branch core-split-probe-binding).
+//
+// Always-on rather than #ifdef'd: the whole probe is two CCOUNT reads, a
+// subtract, a compare and two stores per block per core (~20 cycles against
+// a ~1.39M-cycle block budget at 240MHz, <0.002%), so it cannot meaningfully
+// perturb what it measures, and keeping it unconditional means the measured
+// firmware is the play firmware.  Per-core slots in internal DRAM (uncached
+// on S3), each written only by its own core, so there is no cross-core race;
+// aligned 32-bit stores are atomic.  A reset from core 1 (the binding) can
+// lose at most one in-flight max update from one block -- irrelevant since
+// the procedure resets BEFORE driving the workload.  CCOUNT wraps every
+// ~17.9s at 240MHz; unsigned end-start subtraction stays correct across a
+// wrap as long as one render block is < 2^32 cycles (it is, by ~3000x).
+// Deltas include any preemption of the render task (ISRs, flash-guard
+// parks), which is what the GO/NO-GO question wants anyway: worst real
+// wall-cycles spent before the block is done.
+#include "esp_cpu.h"
+volatile uint32_t amy_render_worst_cyc[2] = { 0, 0 };  // [core] max cycles/block since reset
+volatile uint32_t amy_render_last_cyc[2]  = { 0, 0 };  // [core] most recent block
+
+static inline void amy_render_timed(uint16_t start, uint16_t end, uint8_t core) {
+    uint32_t c0 = esp_cpu_get_cycle_count();
+    amy_render(start, end, core);
+    uint32_t dt = esp_cpu_get_cycle_count() - c0;
+    uint32_t cid = (uint32_t)esp_cpu_get_core_id() & 1;   // index by CPU, not by amy's buffer arg
+    amy_render_last_cyc[cid] = dt;
+    if (dt > amy_render_worst_cyc[cid]) amy_render_worst_cyc[cid] = dt;
+}
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// OPT-10 ADAPTIVE core split.
+//
+// The static split rendered oscs [0, AMY_OSCS/2) on physical core 0
+// (esp_render_task) and [AMY_OSCS/2, AMY_OSCS) on physical core 1 (the fill
+// task).  Voices allocate from LOW osc indices, so core 0 got nearly all the
+// audible oscs and ran ~124-161% of the block budget while core 1 idled at
+// ~34-37% (measured, additive-piano chord).  A block is not done until BOTH
+// cores' renders finish, so max(R0,R1) sets the critical path -- the imbalance
+// is pure lost throughput.
+//
+// We replace the fixed AMY_OSCS/2 boundary with an adaptive index `s`: core 0
+// renders [0, s), core 1 renders [s, AMY_OSCS).  Each block a proportional
+// controller nudges `s` to equalise the two cores' *render* times, using the
+// previous block's per-core cycle counts the probe already captured
+// (amy_render_last_cyc[cpu]).
+//
+// Why balance RENDER times (R0 == R1) and NOT R0 == R1 + fill:  the fill work
+// (combine + per-bus FX + I2S pack) runs on core 1 only AFTER esp_render_on_cores
+// returns, and the combine consumes BOTH cores' fbl[] output, so it cannot begin
+// until core 0's render is also done (the ulTaskNotifyTake barrier below).  Fill
+// is therefore serial after the render barrier, never overlapped with core 0's
+// render, and its cost F is on the critical path for ANY split.  The block's
+// wall time is max(R0,R1) + F; with total render T = R0+R1 roughly fixed, that
+// is minimised at R0 == R1 == T/2.  Targeting R0 == R1 + F would instead idle
+// core 1 for F before the barrier and make the path R0 + F = T/2 + fill + fill
+// -- strictly worse.  (See the report for the break-even analysis: even a
+// perfect split only removes the *sustained* underrun; a single worst 2.77M
+// total-render block still needs F < ~5k cyc to fit 1.39M, which it won't, so
+// the DMA ring must absorb the rare worst block.)
+//
+// Correctness: `s` only repartitions a contiguous, complete, disjoint osc range
+// -- [0,s) U [s,AMY_OSCS) == [0,AMY_OSCS) for every s in [0,AMY_OSCS], every osc
+// rendered exactly once.  The `core` buffer argument (1 for core 0, 0 for the
+// fill task) is UNCHANGED, so per_osc_fb[]/fbl[] accumulator roles, the OPT-11
+// per-core bus masks, and the chorus-mod-source pass (gated on core==0) are all
+// unaffected; the mask-aware combine already sums the two cores' buses
+// split-invariantly.  `s` is published once per block by the fill task BEFORE it
+// notifies core 0 (release via xTaskNotifyGive); core 0 reads it only after its
+// ulTaskNotifyTake wakes (acquire), so both cores use the same `s` for a block
+// and it never changes mid-block (single writer, aligned 16-bit store, atomic).
+volatile uint16_t amy_split_index = 0;   // boundary osc; seeded to AMY_OSCS/2 on first block
+static bool amy_split_inited = false;    // distinct from a legitimately-clamped s==0
+
+// Controller constants.  DEADBAND exceeds ~2x a single audible osc's cost so a
+// settled split does not limit-cycle around the balance point; GAIN_SHIFT gives
+// step ~= imbalance / 16k-cyc-per-osc; MAX_STEP bounds the per-block move so one
+// noisy (ISR-preempted) block cannot fling the split far (self-corrects anyway).
+#define AMY_SPLIT_DEADBAND   65536u   // cycles (~4.7% of a 1.39M block); hysteresis
+#define AMY_SPLIT_GAIN_SHIFT 14       // step = err >> 14  (~1 osc per 16384 cyc)
+#define AMY_SPLIT_MAX_STEP   8        // clamp osc-index move per block
+
+// Compute and publish the next block's split index from the last block's
+// per-core render times.  Runs on the fill task (core 1) only, and only while
+// core 0 is parked between blocks, so it is the sole writer of amy_split_index.
+static void amy_update_split(void) {
+    uint16_t n = AMY_OSCS;
+    if (!amy_split_inited) {                             // first block: match static split
+        amy_split_index = n / 2;                        // (s==0 is a valid clamped state, not "unset")
+        amy_split_inited = true;
+    }
+    uint32_t r0 = amy_render_last_cyc[0];   // physical core 0 render == oscs [0, s)
+    uint32_t r1 = amy_render_last_cyc[1];   // physical core 1 render == oscs [s, N)
+    int32_t err = (int32_t)r0 - (int32_t)r1; // >0 => core 0 too heavy => lower s
+    int32_t mag = err < 0 ? -err : err;
+    if (mag <= (int32_t)AMY_SPLIT_DEADBAND) return;      // balanced enough; hold
+    int32_t step = err >> AMY_SPLIT_GAIN_SHIFT;          // proportional
+    if (step >  AMY_SPLIT_MAX_STEP) step =  AMY_SPLIT_MAX_STEP;
+    if (step < -AMY_SPLIT_MAX_STEP) step = -AMY_SPLIT_MAX_STEP;
+    if (step == 0) step = (err > 0) ? 1 : -1;            // guarantee progress past deadband
+    int32_t s = (int32_t)amy_split_index - step;         // err>0 -> s decreases
+    if (s < 0) s = 0;
+    if (s > (int32_t)n) s = (int32_t)n;
+    amy_split_index = (uint16_t)s;                       // publish (single writer)
+}
+// ---------------------------------------------------------------------------
+
 // Render the second core
 void esp_render_task( void * pvParameters) {
     while(1) {
         ulTaskNotifyTake(pdTRUE, portMAX_DELAY);  // from esp_render_on_cores
-        amy_render(0, AMY_OSCS/2, 1);
+        // amy_split_index was published by the fill task before this notify
+        // (release/acquire across the notify), so it is fixed for this block.
+        amy_render_timed(0, amy_split_index, 1);
         // Tell (someone) we're done.
         xTaskNotifyGive(amy_render_task_done_handle);  // to esp_render_on_cores
     }
@@ -272,15 +392,19 @@ void esp_render_on_cores() {
     if (amy_global.config.platform.multicore) {
         // Tell the esp_render_task to inform *us* when it's done.
         amy_render_task_done_handle = xTaskGetCurrentTaskHandle();
+        // Choose and publish this block's split BEFORE waking core 0, so both
+        // cores render against the same boundary (see OPT-10 note above).
+        amy_update_split();
+        uint16_t s = amy_split_index;   // snapshot: core 1's half must match core 0's
         // Tell the other core to start rendering.
         xTaskNotifyGive(amy_render_handle);  // to esp_render_task
-        // Render me
-        amy_render(AMY_OSCS/2, AMY_OSCS, 0);
+        // Render me: the high half [s, AMY_OSCS)
+        amy_render_timed(s, AMY_OSCS, 0);
         // Wait for the other core to finish
         ulTaskNotifyTake(pdTRUE, portMAX_DELAY);  // from esp_render_task
     } else {
         // We render everything on this core.
-        amy_render(0, AMY_OSCS, 0);
+        amy_render_timed(0, AMY_OSCS, 0);
     }
 }
 
