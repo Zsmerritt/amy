@@ -339,7 +339,8 @@ static inline void amy_render_timed(uint16_t start, uint16_t end, uint8_t core) 
 // notifies core 0 (release via xTaskNotifyGive); core 0 reads it only after its
 // ulTaskNotifyTake wakes (acquire), so both cores use the same `s` for a block
 // and it never changes mid-block (single writer, aligned 16-bit store, atomic).
-volatile uint16_t amy_split_index = 0;   // boundary osc; 0 => uninitialised (set at init)
+volatile uint16_t amy_split_index = 0;   // boundary osc; seeded to AMY_OSCS/2 on first block
+static bool amy_split_inited = false;    // distinct from a legitimately-clamped s==0
 
 // Controller constants.  DEADBAND exceeds ~2x a single audible osc's cost so a
 // settled split does not limit-cycle around the balance point; GAIN_SHIFT gives
@@ -354,7 +355,10 @@ volatile uint16_t amy_split_index = 0;   // boundary osc; 0 => uninitialised (se
 // core 0 is parked between blocks, so it is the sole writer of amy_split_index.
 static void amy_update_split(void) {
     uint16_t n = AMY_OSCS;
-    if (amy_split_index == 0) amy_split_index = n / 2;   // first block: match static split
+    if (!amy_split_inited) {                             // first block: match static split
+        amy_split_index = n / 2;                        // (s==0 is a valid clamped state, not "unset")
+        amy_split_inited = true;
+    }
     uint32_t r0 = amy_render_last_cyc[0];   // physical core 0 render == oscs [0, s)
     uint32_t r1 = amy_render_last_cyc[1];   // physical core 1 render == oscs [s, N)
     int32_t err = (int32_t)r0 - (int32_t)r1; // >0 => core 0 too heavy => lower s
