@@ -675,6 +675,8 @@ struct synthinfo {
     uint32_t note_off_clock;
     uint32_t mod_value_clock;  // Only calculate mod_value once per frame (for mod_source).
     SAMPLE mod_value;  // last value returned by this oscillator when acting as a MOD_SOURCE, not in event
+    SAMPLE pcm_last_out;   // last output value this PCM osc rendered (post-amp), for declick
+    SAMPLE pcm_declick;    // decaying offset canceling PCM waveform discontinuities
     SAMPLE last_scale[MAX_BREAKPOINT_SETS];  // remembers current envelope level, to use as start point in release.
     SAMPLE last_two[2];    // For ALGO feedback ops
     // For filters.  Need 2x because LPF24 uses two instances of filter.

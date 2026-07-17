@@ -261,6 +261,14 @@ void pcm_note_on(uint16_t osc) {
             if(synth[osc]->preset >= pcm_samples) synth[osc]->preset = 0;
         }
         
+        // Declick: if this osc was still emitting audio (voice reuse/steal),
+        // fold its last output into a decaying offset so the phase reset below
+        // doesn't produce a step. Fresh/silent voices have pcm_last_out == 0.
+        // (+=: a retrigger arriving before an earlier declick has drained
+        // accumulates rather than dropping the earlier offset.)
+        synth[osc]->pcm_declick += synth[osc]->pcm_last_out;
+        synth[osc]->pcm_last_out = 0;
+
         synth[osc]->phase = 0; // s16.15 index into the table; as if a PHASOR into a 16 bit sample table.
         // Special case: We use the msynth feedback flag to indicate note-off for looping PCM.  As a result, it's explicitly NOT set in amy:hold_and_modify for PCM voices.  Set it here.
         msynth[osc]->feedback = synth[osc]->feedback;
@@ -372,6 +380,11 @@ SAMPLE render_pcm(SAMPLE* buf, uint16_t osc) {
         // sample -- the only renderer that didn't hoist (firmware review
         // C-5, ~1-4% of a core under drum kits). Written back once below.
         PHASOR phase = synth[osc]->phase;
+        // Declick offset decays by 1/16 per sample (tau ~16 samples ~0.4ms); snap
+        // to zero below ~2 LSB-of-16-bit so fixed-point decay can't stall nonzero.
+        #define PCM_DECLICK_EPS F2S(0.000002f)
+        SAMPLE last_out = synth[osc]->pcm_last_out;
+        SAMPLE declick = synth[osc]->pcm_declick;
         uint8_t status_off = 0;
         uint32_t base_index = INT_OF_P(phase, PCM_INDEX_BITS);
         for(uint16_t i=0; i < AMY_BLOCK_SIZE; i++) {
@@ -381,9 +394,23 @@ SAMPLE render_pcm(SAMPLE* buf, uint16_t osc) {
             uint32_t next_index = base_index + 1;
             if (base_index >= sample_length) {
                 if (preset->type != AMY_PCM_TYPE_FILE) {
-                    synth[osc]->status = SYNTH_OFF;
+                    status_off = 1;
                 }
-                buf[i] = 0;
+                if (last_out != 0) { declick += last_out; last_out = 0; }
+                SAMPLE dz = 0;
+                if (declick != 0) {
+                    dz = declick;
+                    declick -= SHIFTR(declick, 4);
+                    if (declick < PCM_DECLICK_EPS && declick > -PCM_DECLICK_EPS) declick = 0;
+                }
+                buf[i] = dz;
+                // Count the emitted tail in the returned peak: the silent-voice
+                // reaper (render_osc_wave) gates on max_val < AMP_THRESH, and
+                // EG-released feedback>=2 PCM voices now set terminate_on_silence
+                // -- an audible tail must keep the voice unreapable until it has
+                // drained, whatever the decay constant or block size.
+                if (dz < 0) dz = -dz;
+                if (dz > max_value) max_value = dz;
                 continue;
             }
             if (preset->channels == 2) {
@@ -425,6 +452,7 @@ SAMPLE render_pcm(SAMPLE* buf, uint16_t osc) {
                 if(base_index >= sample_length) { // end
                     status_off = 1;
                     sample = 0;
+                    if (last_out != 0) { declick += last_out; last_out = 0; }
                 } else {
                     if(msynth[osc]->feedback > 0) { // still looping.  The feedback flag is cleared by pcm_note_off.
                         if(base_index >= preset->loopend) { // loopend
@@ -442,13 +470,25 @@ SAMPLE render_pcm(SAMPLE* buf, uint16_t osc) {
                     }
                 }
             }
-            SAMPLE value = buf[i] + MUL4_SS(amp, sample);
+            SAMPLE out = MUL4_SS(amp, sample);
+            last_out = out;              // this osc's own contribution, excluding declick
+            if (declick != 0) {
+                out += declick;
+                declick -= SHIFTR(declick, 4);
+                if (declick < PCM_DECLICK_EPS && declick > -PCM_DECLICK_EPS) declick = 0;
+            }
+            SAMPLE value = buf[i] + out;
             buf[i] = value;
             if (value < 0) value = -value;
             if (value > max_value) max_value = value;
         }
         synth[osc]->phase = phase;         // hoisted local written back once
-        if (status_off) synth[osc]->status = SYNTH_OFF;
+        synth[osc]->pcm_last_out = last_out;
+        synth[osc]->pcm_declick = declick;
+        // Defer the off until the declick tail has fully drained (<= ~2 blocks):
+        // next block renders the past-end path above, which emits only the
+        // decaying offset and re-raises status_off until declick snaps to 0.
+        if (status_off && declick == 0) synth[osc]->status = SYNTH_OFF;
         //printf("render_pcm: osc %d preset %d len %d base_ix %d phase %f step %f tablestep %f amp %f\n",
         //       osc, synth[osc]->preset, preset->length, base_index, P2F(synth[osc]->phase), P2F(step), (1 << PCM_INDEX_BITS) * P2F(step), S2F(msynth[osc]->amp));
         return max_value;

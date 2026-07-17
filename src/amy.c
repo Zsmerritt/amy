@@ -940,6 +940,8 @@ void reset_osc_state(struct synthinfo *psynth) {
     psynth->note_off_clock = 0;  // Used to check that last event seen by note was off.
     AMY_UNSET(psynth->mod_value_clock);
     psynth->mod_value = F2S(0);
+    psynth->pcm_last_out = 0;
+    psynth->pcm_declick = 0;
     for(uint8_t j=0;j<MAX_BREAKPOINT_SETS;j++) { psynth->last_scale[j] = 0; }
     psynth->last_two[0] = 0;
     psynth->last_two[1] = 0;
@@ -1609,6 +1611,27 @@ void play_delta(struct delta *d) {
                     case PCM:
                     case PCM_LEFT:
                     case PCM_RIGHT:
+                        // feedback >= 2 is sustain-through-release (see
+                        // pcm_note_off): the sample keeps playing/looping and
+                        // the amp EG's release fades the voice -- which only
+                        // happens if the release clock actually starts. Without
+                        // this, note-off was a complete no-op for these voices:
+                        // looped presets rang forever, one-shots ignored
+                        // key-up. feedback < 2 PCM keeps the old contract
+                        // (no note_off_clock: drums play out; the default
+                        // key-gate bp0 would hard-cut them at note-off).
+                        if (msynth[osc]->feedback >= 2) {
+                            AMY_UNSET(synth[osc]->note_on_clock);
+                            if (AMY_IS_UNSET(synth[osc]->note_off_clock))
+                                synth[osc]->note_off_clock = amy_global.total_samples;
+                            // pcm_note_on forces terminate_on_silence=0 (one-
+                            // shots may have silent gaps); an EG-managed voice
+                            // must be reapable once its release fades out, or a
+                            // looped sample renders silently forever. Only read
+                            // when OSC_IN_RELEASE, so this can't cut a gap
+                            // before note-off.
+                            synth[osc]->terminate_on_silence = 1;
+                        }
                         pcm_note_off(osc);
                         break;
                     case AMY_MIDI: amy_send_midi_note_off(osc); break;
