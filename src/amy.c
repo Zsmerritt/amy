@@ -178,6 +178,14 @@ SAMPLE core_max[AMY_MAX_CORES];
 // target's linker sees it regardless of the ESP macro maze); renders emit
 // a silent block while it is nonzero.
 volatile uint32_t amy_patch_loading = 0;
+// Runtime A/B switch for the EQ silent-bus skip (see AMY_EQ_TAIL_BLOCKS in
+// amy.h). 1 (default): a silent bus's EQ stops running once its tail
+// countdown expires (state frozen at the zero-input fixed point). 0: the
+// pre-skip behavior -- a bus with non-unity EQ keeps running its EQ over
+// zero blocks forever, exactly as before the skip existed. Written from the
+// control task (REPL), read by the fill task; single-byte flag sampled once
+// per bus per block, so no atomics needed and either value is always sane.
+volatile uint8_t amy_eq_silent_skip = 1;
 // Per-core bitmask of buses that received any osc mix this block (OPT-11).
 // fbl[core][bus] is cleared LAZILY on first use; a bus absent from both
 // cores' masks holds stale data and every consumer below must (and does)
@@ -2270,7 +2278,11 @@ int16_t * amy_fill_buffer() {
             // a zero block, so skipping is bit-identical to running, and
             // it would otherwise burn a full 3-band pass per block
             // filtering zeros into zeros.
-            uint8_t eq_tail = eq_on && beq->tail_blocks > 0;
+            // amy_eq_silent_skip == 0 disables the skip at runtime: the EQ
+            // then counts as active FX on every silent block (countdown
+            // ignored), i.e. the pre-skip behavior of filtering zero blocks
+            // forever.
+            uint8_t eq_tail = eq_on && (beq->tail_blocks > 0 || !amy_eq_silent_skip);
             uint8_t fx_active = eq_tail
                 || (AMY_HAS_CHORUS && amy_global.bus[bus]->chorus.level > 0 && amy_global.bus[bus]->chorus.chorus_delay_lines[0] != NULL)
                 || (AMY_HAS_ECHO && amy_global.bus[bus]->echo.level > 0 && amy_global.bus[bus]->echo.echo_delay_lines[0] != NULL)
@@ -2283,7 +2295,8 @@ int16_t * amy_fill_buffer() {
             bus_live |= bit;
             if (eq_tail) {
                 run_eq = 1;
-                beq->tail_blocks--;
+                // (guarded: with the skip disabled eq_tail can be true at 0)
+                if (beq->tail_blocks > 0) beq->tail_blocks--;
             }
         }
         // Per-bus EQ

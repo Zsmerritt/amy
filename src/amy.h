@@ -217,6 +217,13 @@ extern uint16_t amy_reserved_oscs;
 // an 8x margin on the measured settling time.
 #define AMY_EQ_TAIL_BLOCKS 8
 
+// Runtime A/B switch for the silent-bus EQ skip above. 1 (default): skip
+// enabled -- a silent bus's EQ stops after AMY_EQ_TAIL_BLOCKS, state frozen.
+// 0: skip disabled -- non-unity EQ keeps running over zero blocks forever,
+// exactly the pre-skip behavior. Safe to flip at any time from another task
+// (single byte, sampled once per bus per block by amy_fill_buffer).
+extern volatile uint8_t amy_eq_silent_skip;
+
 // reverb setup
 #define REVERB_DEFAULT_LEVEL 0
 #define REVERB_DEFAULT_LIVENESS 0.85f
