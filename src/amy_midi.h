@@ -77,17 +77,13 @@ extern uint8_t sysex_copy_write_idx;
 extern uint8_t sysex_copy_read_idx;
 extern uint16_t sysex_len;
 extern void parse_sysex();
-extern uint8_t last_midi[MIDI_QUEUE_DEPTH][MAX_MIDI_BYTES_PER_MESSAGE];
-extern uint8_t last_midi_len[MIDI_QUEUE_DEPTH];
-// volatile: ring shared across cores (reader = the host MP task); the
-// defining declarations on Tulip are volatile and these must agree or the
-// build fails on conflicting qualifiers.
-// The midi_queue_head/midi_queue_tail cursors are NOT declared here: amy never
-// touches them (they are tulip's ring), and tulip's modtulip.c includes this
-// header only `#ifndef __EMSCRIPTEN__` -- so declaring them here made them
-// invisible to the web build while the code using them still compiled. They
-// now live in tulipcc tulip/shared/midi_in_ring.h, which both their definer
-// and their user include unconditionally.
+// The last_midi ring -- last_midi, last_midi_len, midi_queue_head and
+// midi_queue_tail -- is NOT declared here. It is entirely tulip's: amy never
+// touches it (only comments in amy_midi.c refer to it), and tulip includes this
+// header only `#ifndef __EMSCRIPTEN__`, so declaring it here made it invisible
+// to the web build while the code using it still compiled. It now lives in
+// tulipcc tulip/shared/amy_connector.h, beside the amy_connector.c that defines
+// it and the MIDI_QUEUE_DEPTH/MAX_MIDI_BYTES_PER_MESSAGE that dimension it.
 
 void midi_out(uint8_t * bytes, uint16_t len);
 void midi_local(uint8_t * bytes, uint16_t len);
