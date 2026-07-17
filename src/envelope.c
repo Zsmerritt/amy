@@ -24,7 +24,7 @@ SAMPLE compute_mod_value(uint16_t mod_osc) {
     if(synth[mod_osc]->wave == TRIANGLE) value = compute_mod_triangle(mod_osc);
     if(synth[mod_osc]->wave == SINE) value = compute_mod_sine(mod_osc);
     if(pcm_samples)
-        if(synth[mod_osc]->wave == PCM) value = compute_mod_pcm(mod_osc);
+        if(AMY_WAVE_IS_PCM(synth[mod_osc]->wave)) value = compute_mod_pcm(mod_osc);
     if(AMY_HAS_CUSTOM) {
         if(synth[mod_osc]->wave == CUSTOM) value = compute_mod_custom(mod_osc);
     }
@@ -134,7 +134,11 @@ SAMPLE compute_breakpoint_scale(uint16_t osc, uint8_t bp_set, uint16_t sample_of
         }
     }
     
-    if(found<0) return scale;
+    if(found<0) {
+        // Not via return_label: that path updates last_scale, which this one must not.
+        AMY_PROFILE_STOP(COMPUTE_BREAKPOINT_SCALE)
+        return scale;
+    }
 
     t1 = bp_end_times[found];
     v1 = F2S(synth[osc]->breakpoint_values[bp_set][found]);

@@ -559,6 +559,8 @@ int pcm_load_file() {
     memory_preset->log2sr = log2f((float)info.sample_rate / ZERO_LOGFREQ_IN_HZ);
     memory_preset->midinote = midinote;
     memory_preset->length = total_frames;
+    memory_preset->loopstart = 0;
+    memory_preset->loopend = 0;
     memory_preset->type = AMY_PCM_TYPE_FILE;
     memory_preset->file_bytes_remaining = total_frames * info.channels * 2;
     memory_preset->file_handle = handle;

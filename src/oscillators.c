@@ -857,7 +857,7 @@ SAMPLE render_wavetable(SAMPLE* buf, uint16_t osc) {
     SAMPLE amp = F2S(msynth[osc]->amp);
     SAMPLE last_amp = F2S(msynth[osc]->last_amp);
     //fprintf(stderr, "render_wavetable: time %f osc %d freq %f last_amp %f amp %f preset %d\n", amy_global.total_blocks*AMY_BLOCK_SIZE / (float)AMY_SAMPLE_RATE, osc, AMY_SAMPLE_RATE * P2F(step), S2F(last_amp), S2F(amp), synth[osc]->preset);
-    SAMPLE max_value;
+    SAMPLE max_value_a = 0, max_value_b = 0;
     float interp = MAX(0, MIN(CYCLES_PER_WAVETABLE - 1, (CYCLES_PER_WAVETABLE - 1) * msynth[osc]->duty));  // Don't try to interp beyond end of table.  An N-waveform table can be interpolated from 0 to (N-1-eps).
     int table = MIN((int)floor(interp), CYCLES_PER_WAVETABLE - 2);  // always need both this wavetable and the next one.
     interp = interp - table;  // fractional part, normally < 1.0, but == 1.0 for very end of table.
@@ -895,11 +895,14 @@ SAMPLE render_wavetable(SAMPLE* buf, uint16_t osc) {
     SAMPLE interp_a = F2S(1.0f - interp);
     SAMPLE interp_b = F2S(interp);
     // If we used last_duty, we could actually smoothly interpolate the waveshape crossfade too (except across table boundaries).
-    render_lut(buf, synth[osc]->phase, step, SMULR7(last_amp, interp_a), SMULR7(amp, interp_a), &wavetable_lut, &max_value);
+    render_lut(buf, synth[osc]->phase, step, SMULR7(last_amp, interp_a), SMULR7(amp, interp_a), &wavetable_lut, &max_value_a);
     // Point to next cycle.
     wavetable_lut.table += WAVETABLE_SAMPLES_PER_CYCLE;
-    synth[osc]->phase = render_lut(buf, synth[osc]->phase, step, SMULR7(last_amp, interp_b), SMULR7(amp, interp_b), &wavetable_lut, &max_value);
+    synth[osc]->phase = render_lut(buf, synth[osc]->phase, step, SMULR7(last_amp, interp_b), SMULR7(amp, interp_b), &wavetable_lut, &max_value_b);
     msynth[osc]->last_amp = msynth[osc]->amp;
-    return max_value;
+    // Both sub-renders contribute to the output, so the osc's peak is the max
+    // of the two -- taking only the second's would report ~0 when interp == 0
+    // (duty 0), and the release reaper would kill an audible voice.
+    return MAX(max_value_a, max_value_b);
 }
 #endif

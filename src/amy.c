@@ -1081,18 +1081,35 @@ void alloc_osc(int osc, uint8_t *max_num_breakpoints) {
     uint8_t *ptr = malloc_caps(sizeof(struct synthinfo) + sizeof(struct mod_synthinfo)
                                + total_num_breakpoints * (sizeof(float) + sizeof(uint32_t)),
                                amy_global.config.ram_caps_events);
-    synth[osc] = (struct synthinfo *)ptr;
-    msynth[osc] = (struct mod_synthinfo *)(ptr + sizeof(struct synthinfo));
+    if (ptr == NULL) {
+        // Leave synth[osc]/msynth[osc] alone (callers tolerate NULL); writing
+        // through a garbage pointer would be far worse than a missing osc.
+        fprintf(stderr, "alloc_osc: OUT OF RAM allocating osc %d (%d breakpoints)\n",
+                osc, total_num_breakpoints);
+        return;
+    }
+    struct synthinfo *s = (struct synthinfo *)ptr;
+    struct mod_synthinfo *ms = (struct mod_synthinfo *)(ptr + sizeof(struct synthinfo));
     // Point to the breakpoint sets.
     uint8_t *breakpoint_area = ptr + sizeof(struct synthinfo) + sizeof(struct mod_synthinfo);
     for (int i=0; i < MAX_BREAKPOINT_SETS; ++i) {
-        synth[osc]->max_num_breakpoints[i] = max_num_breakpoints[i];
-        synth[osc]->breakpoint_times[i] = (uint32_t *)breakpoint_area;
+        s->max_num_breakpoints[i] = max_num_breakpoints[i];
+        s->breakpoint_times[i] = (uint32_t *)breakpoint_area;
         breakpoint_area +=  max_num_breakpoints[i] * sizeof(uint32_t);  // must be a multiple of 4 bytes
-        synth[osc]->breakpoint_values[i] = (float *)breakpoint_area;
+        s->breakpoint_values[i] = (float *)breakpoint_area;
         breakpoint_area += sizeof(float) * max_num_breakpoints[i];
     }
-    reset_osc(osc);
+    reset_osc_by_pointer(s, ms);
+    s->osc = osc; // self-reference to make updating oscs easier
+    // Publish LAST, and synth[osc] last of all: the render cores scan
+    // synth[osc] != NULL every block from the other core, so a non-NULL
+    // synth[] entry must never point at a not-yet-initialized struct.
+    msynth[osc] = ms;
+#if defined(_MSC_VER)
+    synth[osc] = s;
+#else
+    __atomic_store_n(&synth[osc], s, __ATOMIC_RELEASE);
+#endif
     //fprintf(stderr, "alloc_osc %d (0x%lx) num_breakpoints %d,%d\n", osc, (long)synth[osc], synth[osc]->max_num_breakpoints[0], synth[osc]->max_num_breakpoints[1]);
 }
 

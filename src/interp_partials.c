@@ -53,6 +53,13 @@ static inline bool use_partial(int h) {
 // choose a preset from the .h file
 void partials_note_on(uint16_t osc) {
     int num_partials = synth[osc]->preset;
+    // preset arrives unclamped from the wire ('p'), and we touch oscs
+    // osc+1..osc+num_partials -- clamp so we never index past synth[].
+    if (num_partials > AMY_OSCS - 1 - osc) {
+        fprintf(stderr, "partials_note_on: osc %d preset %d exceeds AMY_OSCS %d, clamping\n",
+                osc, num_partials, AMY_OSCS);
+        num_partials = (osc < AMY_OSCS - 1) ? (AMY_OSCS - 1 - osc) : 0;
+    }
     for (int i = 0; i < num_partials; ++i) {
         int o = osc + 1 + i;
         ensure_osc_allocd(o, NULL);
@@ -70,8 +77,11 @@ void partials_note_on(uint16_t osc) {
 
 void partials_note_off(uint16_t osc) {
     int num_oscs = synth[osc]->preset;
+    // Same clamp as partials_note_on: preset is unclamped wire data.
+    if (num_oscs > AMY_OSCS - 1 - osc) num_oscs = (osc < AMY_OSCS - 1) ? (AMY_OSCS - 1 - osc) : 0;
     for(uint16_t i = osc + 1; i < osc + 1 + num_oscs; i++) {
         uint16_t o = i % AMY_OSCS;
+        if (synth[o] == NULL) continue;
         AMY_UNSET(synth[o]->note_on_clock);
         synth[o]->note_off_clock = amy_global.total_blocks*AMY_BLOCK_SIZE;
     }
@@ -92,12 +102,15 @@ SAMPLE render_partials(SAMPLE *buf, uint16_t osc) {
         //num_oscs = partials_voice->num_harmonics[0];   // Assume first preset has the max #harmonics.
         num_oscs = interp_partials_max_partials_for_patch(synth[osc]->preset);
     }
+    // Same clamp as partials_note_on: preset is unclamped wire data.
+    if ((int)num_oscs > AMY_OSCS - 1 - osc) num_oscs = (osc < AMY_OSCS - 1) ? (AMY_OSCS - 1 - osc) : 0;
 
     // now, render everything, add it up
     float midi_note = midi_note_for_logfreq(msynth[osc]->logfreq);
     //fprintf(stderr, "t=%u partials o=%d msynth[osc]->logfreq=%f midi_note=%f msynth[amp]=%f\n", amy_global.total_blocks*AMY_BLOCK_SIZE, osc, msynth[osc]->logfreq, midi_note, msynth[osc]->amp);
     for(uint16_t i = osc + 1; i < osc + 1 + num_oscs; i++) {
         uint16_t o = i % AMY_OSCS;
+        if(synth[o] == NULL) continue;
         if(synth[o]->status ==SYNTH_IS_ALGO_SOURCE) {
             // We vary each partial's "velocity" on-the-fly as the way the parent osc's amplitude envelope contributes to the partials.
             synth[o]->velocity = msynth[osc]->amp;
