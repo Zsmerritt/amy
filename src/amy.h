@@ -130,6 +130,40 @@ extern uint8_t amy_partials_harmonic_limit;
 extern uint16_t amy_reserved_oscs;
 #endif
 
+// Register only a sub-window of the big GM bank (GM_FONTS builds): `data`
+// points at blob sample `first_sample`, and blob samples [first_sample,
+// first_sample + num_samples) are the only addressable ones. Presets whose
+// samples fall outside the window resolve to NULL (silent) instead of
+// dereferencing an unmapped address (see pcm.c range guard).
+// amy_set_gm_big_pcm(data) == window(data, 0, GM_BIG_BIN_FRAMES).
+extern void amy_set_gm_big_pcm_window(const int16_t * data,
+                                      uint32_t first_sample,
+                                      uint32_t num_samples);
+
+// Real sizes, in BYTES, of the raw int16 PCM bank blobs the platform provides
+// (sounds/gm/fonts.bin, sounds/gm/fonts_big.bin, drums.bin). Platforms that
+// esp_partition_mmap the blobs out of flash must map these sizes, NOT the
+// partition size: the ESP32-S3 has only 256 64KB data-mmap pages and the
+// partition slices round up past what exists. pcm.c compile-time-checks each
+// value against its map header (2 * *_BIN_FRAMES), so these can't silently
+// drift from the baked maps.
+#define AMY_GM_PCM_BYTES        3617870u  /* == 2 * GM_BIN_FRAMES        */
+#define AMY_GM_BIG_PCM_BYTES    9932684u  /* == 2 * GM_BIG_BIN_FRAMES    */
+#define AMY_GAMMA9001_PCM_BYTES 3735788u  /* == 2 * GAMMA9001_BIN_FRAMES */
+
+// The emu4 font's sample window inside the big bank, in int16 samples from
+// the blob start: [FIRST, END). Presets 1903..2060 -- the only big-bank
+// presets read on-device (tulipcc deck/gmbig.py: "Only the emu4 font is read
+// on-device") -- live exactly here: gm_big_map[1903 - GM_BIG_PRESET_BASE]
+// .offset == FIRST and gm_big_map[2060 - GM_BIG_PRESET_BASE].offset + length
+// == END. amy_set_gm_big_pcm_window re-verifies that against the baked map
+// at registration time and disables the bank (silent + logged) on mismatch,
+// so a rebake can't make a stale window play garbage. Platforms short on
+// mmap vaddr map just this byte range (2*FIRST .. 2*END of the blob) and
+// register it via amy_set_gm_big_pcm_window(map, FIRST, END - FIRST).
+#define AMY_GM_BIG_EMU4_FIRST_SAMPLE 4033544u
+#define AMY_GM_BIG_EMU4_END_SAMPLE   4681049u
+
 // File-streaming buffer size multiplier (in blocks).
 #define PCM_FILE_BUFFER_MULT 8
 

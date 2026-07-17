@@ -55,8 +55,15 @@ memorypcm_ll_t * memorypcm_ll_start;
 
 #define PCM_AMY_LOG2_SAMPLE_RATE log2f(PCM_AMY_SAMPLE_RATE / ZERO_LOGFREQ_IN_HZ)
 
+// Compile-time size check that works on any C/C++ standard (negative array
+// size on failure) -- keeps amy.h's published blob sizes in lockstep with
+// the baked map headers without pulling those headers into platform code.
+#define AMY_PCM_SIZE_CHECK(name, cond) typedef char name[(cond) ? 1 : -1]
+
 #ifdef GAMMA9001
 #include "pcm_gamma9001.h"
+AMY_PCM_SIZE_CHECK(amy_gamma9001_bytes_check,
+                   AMY_GAMMA9001_PCM_BYTES == 2u * GAMMA9001_BIN_FRAMES);
 // Set by the platform at boot: web links the drums.bin blob in and passes it,
 // ESP32-S3 passes the esp_partition_mmap'd partition. NULL = banks unavailable.
 const int16_t * gamma9001_pcm = NULL;
@@ -68,17 +75,56 @@ void amy_set_gamma9001_pcm(const int16_t * data) {
 #ifdef GM_FONTS
 #include "pcm_gm.h"
 #include "pcm_gm_big.h"
-// Set by the platform at boot from two separate esp_partition_mmap ranges of
+AMY_PCM_SIZE_CHECK(amy_gm_bytes_check, AMY_GM_PCM_BYTES == 2u * GM_BIN_FRAMES);
+AMY_PCM_SIZE_CHECK(amy_gm_big_bytes_check,
+                   AMY_GM_BIG_PCM_BYTES == 2u * GM_BIG_BIN_FRAMES);
+AMY_PCM_SIZE_CHECK(amy_gm_big_emu4_window_check,
+                   AMY_GM_BIG_EMU4_FIRST_SAMPLE < AMY_GM_BIG_EMU4_END_SAMPLE &&
+                   AMY_GM_BIG_EMU4_END_SAMPLE <= GM_BIG_BIN_FRAMES);
+// amy_set_gm_big_pcm_window's map sanity check reads the entries for presets
+// 1903 and 2060 (the emu4 window edges) -- keep them inside the map.
+AMY_PCM_SIZE_CHECK(amy_gm_big_emu4_edges_check,
+                   1903 >= GM_BIG_PRESET_BASE &&
+                   2060 < GM_BIG_PRESET_BASE + GM_BIG_NUM_SAMPLES);
+// Set by the platform at boot from separate esp_partition_mmap ranges of
 // the `fonts` partition (one 12.5MB map didn't fit the S3's remaining
 // contiguous data vaddr): gm_pcm = GeneralUser bank (partition offset 0),
-// gm_big_pcm = big multi-font bank (0x300000). NULL = that bank unavailable.
+// gm_big_pcm = big multi-font bank (0x4B0000). NULL = that bank unavailable.
 const int16_t * gm_pcm = NULL;
 void amy_set_gm_pcm(const int16_t * data) {
     gm_pcm = data;
 }
+// The big bank may be only partially resident: gm_big_pcm points at blob
+// sample gm_big_first_sample, and gm_big_num_samples samples follow it.
+// Presets outside that window return NULL (silent) from
+// get_preset_for_preset_number -- their samples have no valid address.
+// Default = whole blob (web/hosted builds that link or map all of it).
 const int16_t * gm_big_pcm = NULL;
+static uint32_t gm_big_first_sample = 0;
+static uint32_t gm_big_num_samples = GM_BIG_BIN_FRAMES;
 void amy_set_gm_big_pcm(const int16_t * data) {
     gm_big_pcm = data;
+    gm_big_first_sample = 0;
+    gm_big_num_samples = GM_BIG_BIN_FRAMES;
+}
+void amy_set_gm_big_pcm_window(const int16_t * data,
+                               uint32_t first_sample, uint32_t num_samples) {
+    // Refuse a stale window: if the published emu4 constants (amy.h) no
+    // longer match the baked map -- e.g. the bank was rebaked and the
+    // constants weren't updated -- the platform just mapped the WRONG byte
+    // range, and translating preset offsets through it would play garbage
+    // (or walk off the map). Silent-but-logged beats garbage-or-crash.
+    if (first_sample == AMY_GM_BIG_EMU4_FIRST_SAMPLE &&
+        (gm_big_map[1903 - GM_BIG_PRESET_BASE].offset != AMY_GM_BIG_EMU4_FIRST_SAMPLE ||
+         gm_big_map[2060 - GM_BIG_PRESET_BASE].offset +
+         gm_big_map[2060 - GM_BIG_PRESET_BASE].length != AMY_GM_BIG_EMU4_END_SAMPLE)) {
+        fprintf(stderr, "gm_big: emu4 window constants out of sync with gm_big_map; big bank disabled\n");
+        gm_big_pcm = NULL;
+        return;
+    }
+    gm_big_pcm = data;
+    gm_big_first_sample = first_sample;
+    gm_big_num_samples = num_samples;
 }
 #endif
 
@@ -144,8 +190,18 @@ memorypcm_preset_t * get_preset_for_preset_number(uint16_t preset_number,
         preset_number < GM_BIG_PRESET_BASE + GM_BIG_NUM_SAMPLES &&
         gm_big_pcm != NULL && rom_local != NULL) {
         const pcm_map_t *g = &gm_big_map[preset_number - GM_BIG_PRESET_BASE];
+        // Range guard: only a window of the blob may be resident (the
+        // ESP32-S3 maps just the emu4 slice). A preset outside the window
+        // has no valid address -- return NULL (silent) rather than
+        // dereferencing unmapped vaddr (reachable from a raw wire message
+        // naming any big-bank preset number).
+        if (g->offset < gm_big_first_sample)
+            return NULL;
+        uint32_t rel = g->offset - gm_big_first_sample;
+        if (rel >= gm_big_num_samples || g->length > gm_big_num_samples - rel)
+            return NULL;
         memset(rom_local, 0, sizeof(*rom_local));
-        rom_local->sample_ram = (int16_t *)gm_big_pcm + g->offset;
+        rom_local->sample_ram = (int16_t *)gm_big_pcm + rel;
         rom_local->length = g->length;
         rom_local->loopstart = g->loopstart;
         rom_local->loopend = g->loopend;
@@ -235,6 +291,12 @@ void pcm_note_on(uint16_t osc) {
         memorypcm_preset_t rom_local;
         memorypcm_preset_t *preset =
             get_preset_for_preset_number(synth[osc]->preset, &rom_local);
+        if (preset == NULL) {
+            // Unresolvable preset (e.g. big-bank preset outside the mapped
+            // emu4 window): stay silent, don't dereference.
+            synth[osc]->status = SYNTH_OFF;
+            return;
+        }
         if (preset->type == AMY_PCM_TYPE_FILE) {
             if (preset->file_handle != 0) {
                 wave_info_t info = {0};
@@ -338,6 +400,12 @@ SAMPLE render_pcm(SAMPLE* buf, uint16_t osc) {
         memorypcm_preset_t rom_local;
         memorypcm_preset_t *preset =
             get_preset_for_preset_number(synth[osc]->preset, &rom_local);
+        if (preset == NULL) {
+            // Unresolvable preset (e.g. big-bank preset outside the mapped
+            // emu4 window): render silence and shut the voice off.
+            synth[osc]->status = SYNTH_OFF;
+            return 0;
+        }
         float logfreq = msynth[osc]->logfreq;
         // If osc[midi_note] is set, shift the freq by the preset's default base_note.
         if (AMY_IS_SET(synth[osc]->midi_note)) {
