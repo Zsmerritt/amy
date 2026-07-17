@@ -347,7 +347,10 @@ void dealloc_chorus_delay_lines(uint8_t bus) {
     amy_global.bus[bus]->chorus.delay_mod = NULL;
 }
 
-void alloc_chorus_delay_lines(uint8_t bus) {
+// Returns true only if delay_mod AND every delay line allocated; on false all
+// of them are NULL (dealloc rolls back). Callers MUST NOT touch the lines when
+// this returns false -- see config_chorus.
+bool alloc_chorus_delay_lines(uint8_t bus) {
     amy_global.bus[bus]->chorus.delay_mod = (SAMPLE *)malloc_caps(sizeof(SAMPLE) * AMY_BLOCK_SIZE, amy_global.config.ram_caps_delay);
     if (amy_global.bus[bus]->chorus.delay_mod == NULL) {
         // FW-12: delay_mod was unchecked. render bzero's/renders into it every
@@ -357,7 +360,7 @@ void alloc_chorus_delay_lines(uint8_t bus) {
         // subsequent config_chorus re-raising level can't crash on the NULL.
         fprintf(stderr, "unable to alloc chorus delay_mod, chorus disabled\n");
         dealloc_chorus_delay_lines(bus);
-        return;
+        return false;
     }
     bool success = true;
     for(int c = 0; c < AMY_NCHANS; ++c) {
@@ -372,7 +375,9 @@ void alloc_chorus_delay_lines(uint8_t bus) {
     if (!success) {
         fprintf(stderr, "unable to alloc chorus of %d samples\n", (int)DELAY_LINE_LEN);
         dealloc_chorus_delay_lines(bus);
+        return false;
     }
+    return true;
 }
 
 void config_chorus(uint8_t bus, float level, uint16_t max_delay, float lfo_freq, float depth) {
@@ -386,7 +391,16 @@ void config_chorus(uint8_t bus, float level, uint16_t max_delay, float lfo_freq,
     if (level > 0) {
         // only allocate delay lines if chorus is more than inaudible.
         if (amy_global.bus[bus]->chorus.chorus_delay_lines[0] == NULL) {
-            alloc_chorus_delay_lines(bus);
+            // FW-12 guarded the render side against a failed alloc but not this,
+            // the config side: alloc_chorus_delay_lines() deallocs to all-NULL on
+            // failure and we then fell straight through to the fx_flush and the
+            // chorus_delay_lines[chan]->fixed_delay store below -- a NULL deref.
+            // Bail exactly like config_echo's alloc_echo_delay_lines() failure
+            // path. The alloc already logged the reason (once per attempt, not
+            // per block); level is left at its old value, so the render-side
+            // guards on chorus_delay_lines[0]/delay_mod keep chorus silent, and a
+            // later config_chorus with level>0 retries the alloc.
+            if (!alloc_chorus_delay_lines(bus)) return;
         }
         // 0 -> >0 after a long disable: drop the frozen tail (see fx_line_is_stale).
         if (old_level == 0 && fx_line_is_stale(amy_global.bus[bus]->chorus.disabled_at_block))
@@ -438,6 +452,13 @@ void dealloc_reverb_delay_lines(uint8_t bus) {
     if (amy_global.bus[bus]->reverb.rev != NULL) {
         deinit_stereo_reverb(amy_global.bus[bus]->reverb.rev);
         delete_reverb(amy_global.bus[bus]->reverb.rev);
+        // NULL it, like the echo/chorus deallocs do. Without this the freed
+        // pointer stays live in the bus, and alloc_reverb_delay_lines() only
+        // calls new_reverb() when rev == NULL -- so any second enable after a
+        // dealloc would init_stereo_reverb() straight into freed memory. Only
+        // the full-teardown path calls this today, which is why it has not
+        // bitten; that is a property of the callers, not of this function.
+        amy_global.bus[bus]->reverb.rev = NULL;
     }
 }
 

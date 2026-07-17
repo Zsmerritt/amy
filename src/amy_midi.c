@@ -307,6 +307,9 @@ void midi_clock_received() {
 */
 
 uint16_t sysex_len = 0;
+// Latched when a sysex overruns sysex_buffer. The message is then dropped at
+// its closing F7 rather than truncated -- see convert_midi_bytes_to_messages().
+static uint8_t sysex_overflow = 0;
 #if defined(TULIP) || defined(AMYBOARD)
 extern const mp_obj_fun_builtin_var_t tulip_amy_send_sysex_obj;
 #endif
@@ -403,9 +406,46 @@ void convert_midi_bytes_to_messages(uint8_t * data, size_t len, uint8_t usb) {
         if(sysex_flag) {
             if(byte == 0xF7) {
                 sysex_flag = 0;
-                parse_sysex();
+                if(sysex_overflow) {
+                    // What we hold is a prefix of a message we could not store.
+                    // Dropping is the only honest option (see below).
+                    sysex_overflow = 0;
+                    sysex_len = 0;
+                } else {
+                    parse_sysex();
+                }
             } else {
-                sysex_buffer[sysex_len++] = byte;
+                // Bound the write. sysex_len is a uint16_t and MAX_SYSEX_BYTES is
+                // 16KB, so a sysex whose F7 never arrives (cable pulled mid-message,
+                // line noise) used to run sysex_len all the way to 65535 -- ~48KB
+                // written past a buffer that shares the PSRAM heap with the
+                // MicroPython GC heap and the GM bank fallback. The failure landed
+                // arbitrarily later, nowhere near the cause.
+                //
+                // Stop at MAX_SYSEX_BYTES-1, not MAX_SYSEX_BYTES: parse_sysex()
+                // NUL-terminates with sysex_buffer[sysex_len], which at exactly
+                // MAX_SYSEX_BYTES would be a 1-byte overflow of its own. Reserving
+                // the last byte here is what makes that store in-bounds.
+                //
+                // DROP the message rather than truncate it. A truncated sysex is a
+                // silent corruption: an SPSS z* transfer would hand a half-written
+                // payload to amy_add_message()/MicroPython as if it were complete.
+                // So: stop storing, latch the overflow, discard at the F7, and say
+                // so ONCE per message on stderr -- not once per byte, which at MIDI
+                // rates would flood the console -- matching how the FX alloc
+                // failures report. sysex_buffer is NULL if its (unchecked) malloc
+                // in run_midi() failed; same policy, and it names itself.
+                if(sysex_buffer == NULL) {
+                    if(!sysex_overflow) {
+                        sysex_overflow = 1;
+                        fprintf(stderr, "sysex_buffer not allocated, dropping sysex message\n");
+                    }
+                } else if(sysex_len < MAX_SYSEX_BYTES - 1) {
+                    sysex_buffer[sysex_len++] = byte;
+                } else if(!sysex_overflow) {
+                    sysex_overflow = 1;
+                    fprintf(stderr, "sysex longer than %d bytes, dropping message\n", MAX_SYSEX_BYTES - 1);
+                }
             }
         } else {
             if(byte & 0x80) { // new status byte
@@ -425,7 +465,9 @@ void convert_midi_bytes_to_messages(uint8_t * data, size_t len, uint8_t usb) {
                 } else {
                     // Channel Voice (0x80-0xE0) or System Common (0xF0-0xF7):
                     // these begin a fresh message and cancel running status.
-                    sysex_flag = 0; sysex_len = 0;
+                    // Clears sysex_overflow too: this is the other way an
+                    // F7-less sysex ends, and the next F0 must start clean.
+                    sysex_flag = 0; sysex_len = 0; sysex_overflow = 0;
                     current_midi_message[0] = byte;
                     midi_message_slot = 0; // drop any half-collected data bytes
                     if(byte == 0xF4 || byte == 0xF5 || byte == 0xF6) {
