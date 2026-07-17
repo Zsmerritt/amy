@@ -893,8 +893,8 @@ const pcm_map_t gm_big_map[GM_BIG_NUM_SAMPLES] PROGMEM = {
     /* [876] preset 1900 */ {4018089, 711, 0, 711, 97}, /* $ Castanets (drum) */
     /* [877] preset 1901 */ {4018800, 7372, 0, 7372, 86}, /* $ Timbale Low  C113 (drum) */
     /* [878] preset 1902 */ {4026172, 7372, 0, 7372, 87}, /* $ Timbale Low  C113 (drum) */
-    /* [879] preset 1903 */ {4033544, 18869, 13309, 18302, 74}, /* Piano Ab2      R (std) */
-    /* [880] preset 1904 */ {4052413, 10686, 9717, 10670, 92}, /* Piano Gb4      R (std) */
+    /* [879] preset 1903 */ {4033544, 18869, 12808, 18489, 74}, /* Piano Ab2      R (std); loop repointed: baked seam was phase-flipped (rhythmic click) */
+    /* [880] preset 1904 */ {4052413, 10686, 8322, 9322, 92}, /* Piano Gb4      R (std); loop repointed: baked seam was phase-flipped (rhythmic click) */
     /* [881] preset 1905 */ {4063099, 10484, 10400, 10480, 61}, /* CP70 D#2 (std) */
     /* [882] preset 1906 */ {4073583, 8788, 8768, 8784, 89}, /* CP70 A4 (std) */
     /* [883] preset 1907 */ {4082371, 786, 722, 782, 66}, /* EP1 2 C3 (std) */
