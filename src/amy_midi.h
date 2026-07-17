@@ -82,18 +82,12 @@ extern uint8_t last_midi_len[MIDI_QUEUE_DEPTH];
 // volatile: ring shared across cores (reader = the host MP task); the
 // defining declarations on Tulip are volatile and these must agree or the
 // build fails on conflicting qualifiers.
-// Default build: SPSC ring, int16_t INDICES 0..MIDI_QUEUE_DEPTH-1, writer =
-// the AMY MIDI task only (all other producers funnel through
-// amy_midi_inject). AMY_MIDI_MPSC build: multi-producer ring, uint16_t
-// MONOTONIC counters (slot = value % depth; 65536 % 1024 == 0 so the wrap
-// is seamless). See tulipcc tulip/shared/midi_in_ring.h for the disciplines.
-#ifdef AMY_MIDI_MPSC
-extern volatile uint16_t midi_queue_tail;
-extern volatile uint16_t midi_queue_head;
-#else
-extern volatile int16_t midi_queue_tail;
-extern volatile int16_t midi_queue_head;
-#endif
+// The midi_queue_head/midi_queue_tail cursors are NOT declared here: amy never
+// touches them (they are tulip's ring), and tulip's modtulip.c includes this
+// header only `#ifndef __EMSCRIPTEN__` -- so declaring them here made them
+// invisible to the web build while the code using them still compiled. They
+// now live in tulipcc tulip/shared/midi_in_ring.h, which both their definer
+// and their user include unconditionally.
 
 void midi_out(uint8_t * bytes, uint16_t len);
 void midi_local(uint8_t * bytes, uint16_t len);
