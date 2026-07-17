@@ -17,6 +17,33 @@ void amy_process_single_midi_byte(uint8_t byte, uint8_t from_web_or_usb);
 void amy_external_midi_output(uint8_t * data, uint32_t len);
 void amy_external_midi_sync(uint8_t enabled);
 
+// One parser context per MIDI byte STREAM. The stream parser keeps state
+// across calls (running status, collected data bytes, inside-sysex), so two
+// byte streams must never share a context -- and, in the default build, the
+// parser plus everything downstream of it may only run on the AMY MIDI task
+// (see amy_midi_inject). Spec and rationale: amy_midi_parse.h.
+typedef enum {
+    AMY_MIDI_SOURCE_UART = 0,  // DIN/UART, parsed directly by the MIDI task
+                               // (also the context behind the single-source
+                               // compatibility entry convert_midi_bytes_to_messages)
+    AMY_MIDI_SOURCE_USB_HOST,  // Tulip USB-host MIDI (packetized: usb flag 1)
+    AMY_MIDI_SOURCE_LOCAL,     // tulip.midi_local() from MicroPython (byte stream)
+    AMY_MIDI_SOURCE_GADGET,    // TinyUSB gadget MIDI (packetized), AMYBOARD
+    AMY_MIDI_SOURCE_COUNT
+} amy_midi_source_t;
+
+#ifdef ESP_PLATFORM
+// Hand bytes from a task that is NOT the AMY MIDI task to the MIDI input
+// path. Default build: enqueues into a small funnel queue drained by the
+// MIDI task within ~1ms -- never blocks; on a full/missing queue the bytes
+// are dropped LOUDLY (counted in amy_midi_inject_drops, logged on a
+// power-of-two schedule, readable from Python as tulip.midi_in_drops()).
+// AMY_MIDI_MPSC build: parses immediately in the caller's task using the
+// source's own context.
+void amy_midi_inject(amy_midi_source_t source, const uint8_t *bytes, uint16_t len);
+extern volatile uint32_t amy_midi_inject_drops;
+#endif
+
 
 #define MAX_MIDI_BYTES_TO_PARSE 1024
 #define MAX_MIDI_BYTES_PER_MESSAGE 3
@@ -52,11 +79,21 @@ extern uint16_t sysex_len;
 extern void parse_sysex();
 extern uint8_t last_midi[MIDI_QUEUE_DEPTH][MAX_MIDI_BYTES_PER_MESSAGE];
 extern uint8_t last_midi_len[MIDI_QUEUE_DEPTH];
-// volatile: SPSC ring shared across cores (writer = MIDI task, reader =
-// the host MP task); the defining declarations on Tulip are volatile and
-// these must agree or the build fails on conflicting qualifiers
+// volatile: ring shared across cores (reader = the host MP task); the
+// defining declarations on Tulip are volatile and these must agree or the
+// build fails on conflicting qualifiers.
+// Default build: SPSC ring, int16_t INDICES 0..MIDI_QUEUE_DEPTH-1, writer =
+// the AMY MIDI task only (all other producers funnel through
+// amy_midi_inject). AMY_MIDI_MPSC build: multi-producer ring, uint16_t
+// MONOTONIC counters (slot = value % depth; 65536 % 1024 == 0 so the wrap
+// is seamless). See tulipcc tulip/shared/midi_in_ring.h for the disciplines.
+#ifdef AMY_MIDI_MPSC
+extern volatile uint16_t midi_queue_tail;
+extern volatile uint16_t midi_queue_head;
+#else
 extern volatile int16_t midi_queue_tail;
 extern volatile int16_t midi_queue_head;
+#endif
 
 void midi_out(uint8_t * bytes, uint16_t len);
 void midi_local(uint8_t * bytes, uint16_t len);
