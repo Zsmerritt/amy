@@ -257,11 +257,52 @@ TaskHandle_t amy_update_handle = NULL;
 // Who esp_render_task tells that it is done.
 TaskHandle_t amy_render_task_done_handle = NULL;
 
+// ---------------------------------------------------------------------------
+// OPT-9 core-split probe: per-core cycle cost of amy_render() per block.
+//
+// The osc split across the two cores is STATIC (AMY_OSCS/2): esp_render_task
+// (pinned core 0, which also runs Tulip's display) renders oscs [0, N/2);
+// esp_render_on_cores' caller (fill-buffer task, pinned core 1) renders
+// [N/2, N).  Voices allocate from LOW osc numbers, so core 0 fills up first
+// while core 1 may idle.  These counters measure that imbalance on-device:
+// CCOUNT (cycle counter, one per core) is read right around each core's
+// amy_render() call and the worst (max) per-block delta is kept per core,
+// plus the most recent block's delta.  Read/reset from MicroPython via
+// tulip.render_cyc() (tulipcc branch core-split-probe-binding).
+//
+// Always-on rather than #ifdef'd: the whole probe is two CCOUNT reads, a
+// subtract, a compare and two stores per block per core (~20 cycles against
+// a ~1.39M-cycle block budget at 240MHz, <0.002%), so it cannot meaningfully
+// perturb what it measures, and keeping it unconditional means the measured
+// firmware is the play firmware.  Per-core slots in internal DRAM (uncached
+// on S3), each written only by its own core, so there is no cross-core race;
+// aligned 32-bit stores are atomic.  A reset from core 1 (the binding) can
+// lose at most one in-flight max update from one block -- irrelevant since
+// the procedure resets BEFORE driving the workload.  CCOUNT wraps every
+// ~17.9s at 240MHz; unsigned end-start subtraction stays correct across a
+// wrap as long as one render block is < 2^32 cycles (it is, by ~3000x).
+// Deltas include any preemption of the render task (ISRs, flash-guard
+// parks), which is what the GO/NO-GO question wants anyway: worst real
+// wall-cycles spent before the block is done.
+#include "esp_cpu.h"
+volatile uint32_t amy_render_worst_cyc[2] = { 0, 0 };  // [core] max cycles/block since reset
+volatile uint32_t amy_render_last_cyc[2]  = { 0, 0 };  // [core] most recent block
+
+static inline void amy_render_timed(uint16_t start, uint16_t end, uint8_t core) {
+    uint32_t c0 = esp_cpu_get_cycle_count();
+    amy_render(start, end, core);
+    uint32_t dt = esp_cpu_get_cycle_count() - c0;
+    uint32_t cid = (uint32_t)esp_cpu_get_core_id() & 1;   // index by CPU, not by amy's buffer arg
+    amy_render_last_cyc[cid] = dt;
+    if (dt > amy_render_worst_cyc[cid]) amy_render_worst_cyc[cid] = dt;
+}
+// ---------------------------------------------------------------------------
+
 // Render the second core
 void esp_render_task( void * pvParameters) {
     while(1) {
         ulTaskNotifyTake(pdTRUE, portMAX_DELAY);  // from esp_render_on_cores
-        amy_render(0, AMY_OSCS/2, 1);
+        amy_render_timed(0, AMY_OSCS/2, 1);
         // Tell (someone) we're done.
         xTaskNotifyGive(amy_render_task_done_handle);  // to esp_render_on_cores
     }
@@ -275,12 +316,12 @@ void esp_render_on_cores() {
         // Tell the other core to start rendering.
         xTaskNotifyGive(amy_render_handle);  // to esp_render_task
         // Render me
-        amy_render(AMY_OSCS/2, AMY_OSCS, 0);
+        amy_render_timed(AMY_OSCS/2, AMY_OSCS, 0);
         // Wait for the other core to finish
         ulTaskNotifyTake(pdTRUE, portMAX_DELAY);  // from esp_render_task
     } else {
         // We render everything on this core.
-        amy_render(0, AMY_OSCS, 0);
+        amy_render_timed(0, AMY_OSCS, 0);
     }
 }
 
