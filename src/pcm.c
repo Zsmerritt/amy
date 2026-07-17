@@ -81,6 +81,11 @@ AMY_PCM_SIZE_CHECK(amy_gm_big_bytes_check,
 AMY_PCM_SIZE_CHECK(amy_gm_big_emu4_window_check,
                    AMY_GM_BIG_EMU4_FIRST_SAMPLE < AMY_GM_BIG_EMU4_END_SAMPLE &&
                    AMY_GM_BIG_EMU4_END_SAMPLE <= GM_BIG_BIN_FRAMES);
+// amy_set_gm_big_pcm_window's map sanity check reads the entries for presets
+// 1903 and 2060 (the emu4 window edges) -- keep them inside the map.
+AMY_PCM_SIZE_CHECK(amy_gm_big_emu4_edges_check,
+                   1903 >= GM_BIG_PRESET_BASE &&
+                   2060 < GM_BIG_PRESET_BASE + GM_BIG_NUM_SAMPLES);
 // Set by the platform at boot from separate esp_partition_mmap ranges of
 // the `fonts` partition (one 12.5MB map didn't fit the S3's remaining
 // contiguous data vaddr): gm_pcm = GeneralUser bank (partition offset 0),
