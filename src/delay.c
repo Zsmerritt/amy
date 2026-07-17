@@ -214,6 +214,10 @@ void config_stereo_reverb(reverb_params_t *rev, float a_liveness, float crossove
     //printf("config_stereo_reverb: liveness %f xover %f damping %f\n",
     //       a_liveness, crossover_hz, damping);
     // liveness (0..1) controls how much energy is preserved (larger = longer reverb).
+    // Clamp: the tank's loop gain IS liveness, so >= 1.0 never decays -- sustained input
+    // then accumulates until int32 wraps into a permanent full-scale latch.
+    if (a_liveness > 0.99f)  a_liveness = 0.99f;
+    if (a_liveness < 0.0f)  a_liveness = 0.0f;
     rev->liveness = F2S(a_liveness);
     // crossover_hz is 3dB point of 1-pole lowpass freq.
     rev->lpfcoef = F2S(6.2832f * crossover_hz / AMY_SAMPLE_RATE);
@@ -293,6 +297,14 @@ bool init_stereo_reverb(reverb_params_t *rev) {
         deinit_stereo_reverb(rev);  // rolls back all partial allocations, NULLs all pointers
         return false;
     }
+
+    // A fresh room must start silent: deinit/init frees and reallocs the delay
+    // lines but previously left the four LPF states behind, so a "new" reverb
+    // began with stale filter state leaked across lifecycles.
+    rev->f1state = 0;
+    rev->f2state = 0;
+    rev->f3state = 0;
+    rev->f4state = 0;
 
     config_stereo_reverb(rev, INITIAL_LIVENESS, INITIAL_XOVER_HZ, INITIAL_DAMPING);
     return true;

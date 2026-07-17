@@ -218,6 +218,11 @@ extern uint16_t amy_reserved_oscs;
 #define ECHO_DEFAULT_FEEDBACK 0
 #define ECHO_DEFAULT_FILTER_COEF 0
 
+// FX with level 0 are skipped, not advanced, so their delay lines freeze with old
+// audio. (~1 s at 256/44100; a level that has been 0 longer than this flushes the
+// frozen line on re-enable.)
+#define FX_STALE_FLUSH_BLOCKS 172
+
 #define AMY_SEQUENCER_PPQ 48
 
 #define DELAY_LINE_LEN 512  // 11 ms @ 44 kHz
@@ -838,6 +843,7 @@ typedef struct reverb_params {
 
 typedef struct reverb_state {
     SAMPLE level;
+    uint32_t disabled_at_block;  // total_blocks when level last went >0 -> 0.
     float liveness;
     float damping;
     float xover_hz;
@@ -846,6 +852,7 @@ typedef struct reverb_state {
 
 typedef struct chorus_config {
     SAMPLE level;     // How much of the delayed signal to mix in to the output, typ F2S(0.5).
+    uint32_t disabled_at_block;  // total_blocks when level last went >0 -> 0.
     int32_t max_delay;    // Max delay when modulating.  Must be <= DELAY_LINE_LEN
     float lfo_freq;
     float depth;
@@ -855,6 +862,7 @@ typedef struct chorus_config {
 
 typedef struct echo_config {
     SAMPLE level;  // Mix of echo into output.  0 = Echo off.
+    uint32_t disabled_at_block;  // total_blocks when level last went >0 -> 0.
     uint32_t delay_samples;  // Current delay, quantized to samples.
     uint32_t max_delay_samples;  // Maximum delay, i.e. size of allocated delay line.
     SAMPLE feedback;  // Gain applied when feeding back output to input.

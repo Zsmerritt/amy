@@ -264,6 +264,30 @@ uint32_t enclosing_power_of_2(uint32_t n) {
     return result;
 }
 
+// FX stale-line flush (used by config_reverb/config_echo/config_chorus).
+// An FX with level 0 is SKIPPED, not advanced, and its delay lines are only freed
+// at full deinit -- so they freeze holding whatever audio was in flight when the
+// level hit 0, and re-enabling minutes later audibly replays that ghost. If the
+// level has been 0 for longer than FX_STALE_FLUSH_BLOCKS we zero the lines on
+// re-enable; shorter than that (a slider wiggling through zero) keeps its tail.
+//
+// TRADEOFF: the flush runs on the delta/audio task, and for reverb's ten lines
+// (~100KB) the memset can overrun one 5.8 ms audio block. That is accepted and
+// happens at most once per re-enable: one rare click beats a phantom chord from
+// twenty minutes ago.
+static bool fx_line_is_stale(uint32_t disabled_at_block) {
+    // Unsigned arithmetic: wraps correctly if total_blocks overflows, and a
+    // total_blocks reset (amy_reset) reads as stale, which flushes -- correct
+    // for a fresh start. A fresh boot is 0 - 0 == 0, which is not stale.
+    return (amy_global.total_blocks - disabled_at_block) > FX_STALE_FLUSH_BLOCKS;
+}
+
+// Guards both the line and its buffer: a line may be NULL after a failed init.
+static void fx_flush_delay_line(delay_line_t *delay_line) {
+    if (delay_line != NULL && delay_line->samples != NULL)
+        bzero(delay_line->samples, delay_line->len * sizeof(SAMPLE));
+}
+
 void config_echo(uint8_t bus, float level, float delay_ms, float max_delay_ms, float feedback, float filter_coef) {
     if (AMY_IS_UNSET(level)) level = S2F(amy_global.bus[bus]->echo.level);
     if (AMY_IS_UNSET(delay_ms)) delay_ms = (amy_global.bus[bus]->echo.delay_samples + 0.5f) / (AMY_SAMPLE_RATE / 1000.f);
@@ -277,23 +301,35 @@ void config_echo(uint8_t bus, float level, float delay_ms, float max_delay_ms, f
     amy_global.bus[bus]->echo.max_delay_samples = max_delay_samples;
     //fprintf(stderr, "config_echo: bus %d delay=%.3f ms / %d samps max_delay=%.3f ms / %d samps echo.max_delay_samples=%d\n", bus, delay_ms, delay_samples, max_delay_ms, max_delay_samples, amy_global.bus[bus]->echo.max_delay_samples);
 
+    SAMPLE old_level = amy_global.bus[bus]->echo.level;
     if (level > 0) {
         if (amy_global.bus[bus]->echo.echo_delay_lines[0] == NULL) {
             // Delay line len must be power of 2.
             if (!alloc_echo_delay_lines(bus, max_delay_samples)) return;
             //fprintf(stderr, "config_echo: max_delay_samples=%d\n", max_delay_samples);
         }
+        // 0 -> >0 after a long disable: drop the frozen tail (see fx_line_is_stale).
+        if (old_level == 0 && fx_line_is_stale(amy_global.bus[bus]->echo.disabled_at_block))
+            for (int c = 0; c < AMY_NCHANS; ++c)
+                fx_flush_delay_line(amy_global.bus[bus]->echo.echo_delay_lines[c]);
         // Apply delay.  We have to stay 1 sample less than delay line length for FIR EQ delay.
         if (delay_samples > amy_global.bus[bus]->echo.max_delay_samples - 1) delay_samples = amy_global.bus[bus]->echo.max_delay_samples - 1;
         for (int c = 0; c < AMY_NCHANS; ++c) {
             amy_global.bus[bus]->echo.echo_delay_lines[c]->fixed_delay = delay_samples;
         }
+    } else if (old_level > 0) {
+        // >0 -> 0: remember when the lines froze.
+        amy_global.bus[bus]->echo.disabled_at_block = amy_global.total_blocks;
     }
     amy_global.bus[bus]->echo.level = F2S(level);
     amy_global.bus[bus]->echo.delay_samples = delay_samples;
     // Filter is IIR [1, filter_coef] normalized for filter_coef > 0 (LPF), or FIR [1, filter_coef] normalized for filter_coef < 0 (HPF).
     if (filter_coef > 0.99)  filter_coef = 0.99;  // Avoid unstable filters.
     amy_global.bus[bus]->echo.filter_coef = F2S(filter_coef);
+    // Clamp magnitude (negative feedback is legitimate): |feedback| >= 1.0 makes the
+    // echo a non-decaying accumulator that wraps int32 into a permanent latch.
+    if (feedback > 0.99f)  feedback = 0.99f;
+    if (feedback < -0.99f)  feedback = -0.99f;
     // FIR filter potentially has gain > 1 for high frequencies, so discount the loop feedback to stop things exploding.
     if (filter_coef < 0)  feedback /= 1.f - filter_coef;
     amy_global.bus[bus]->echo.feedback = F2S(feedback);
@@ -344,11 +380,16 @@ void config_chorus(uint8_t bus, float level, uint16_t max_delay, float lfo_freq,
     if (AMY_IS_UNSET(depth)) depth = amy_global.bus[bus]->chorus.depth;
     //fprintf(stderr, "config_chorus: osc %d level %.3f max_del %d lfo_freq %.3f depth %.3f\n",
     //        CHORUS_MOD_SOURCE + bus, level, max_delay, lfo_freq, depth);
+    SAMPLE old_level = amy_global.bus[bus]->chorus.level;
     if (level > 0) {
         // only allocate delay lines if chorus is more than inaudible.
         if (amy_global.bus[bus]->chorus.chorus_delay_lines[0] == NULL) {
             alloc_chorus_delay_lines(bus);
         }
+        // 0 -> >0 after a long disable: drop the frozen tail (see fx_line_is_stale).
+        if (old_level == 0 && fx_line_is_stale(amy_global.bus[bus]->chorus.disabled_at_block))
+            for (int c = 0; c < AMY_NCHANS; ++c)
+                fx_flush_delay_line(amy_global.bus[bus]->chorus.chorus_delay_lines[c]);
         // apply max_delay.
         for (int chan=0; chan<AMY_NCHANS; ++chan) {
             //chorus_delay_lines[chan]->max_delay = max_delay;
@@ -371,6 +412,9 @@ void config_chorus(uint8_t bus, float level, uint16_t max_delay, float lfo_freq,
         // apply depth, lfo_freq
         synth[CHORUS_MOD_SOURCE + bus]->amp_coefs[COEF_CONST] = depth;
         synth[CHORUS_MOD_SOURCE + bus]->logfreq_coefs[COEF_CONST] = logfreq_of_freq(lfo_freq);
+    } else if (old_level > 0) {
+        // >0 -> 0: remember when the lines froze.
+        amy_global.bus[bus]->chorus.disabled_at_block = amy_global.total_blocks;
     }
     amy_global.bus[bus]->chorus.max_delay = max_delay;
     amy_global.bus[bus]->chorus.level = F2S(level);
@@ -407,16 +451,41 @@ void config_reverb(uint8_t bus, float level, float liveness, float damping, floa
     if (AMY_IS_UNSET(liveness)) liveness = amy_global.bus[bus]->reverb.liveness;
     if (AMY_IS_UNSET(damping)) damping = amy_global.bus[bus]->reverb.damping;
     if (AMY_IS_UNSET(xover_hz)) xover_hz = amy_global.bus[bus]->reverb.xover_hz;
+    SAMPLE old_level = amy_global.bus[bus]->reverb.level;
     if (level > 0) {
         //printf("config_reverb: level %f liveness %f xover %f damping %f\n",
         //      level, liveness, xover_hz, damping);
-        if (amy_global.bus[bus]->reverb.level == 0) {
+        if (old_level == 0) {
             if (!alloc_reverb_delay_lines(bus)) {
                 amy_global.bus[bus]->reverb.level = 0;
                 return;
             }
+            // 0 -> >0 after a long disable: drop the frozen tail (see fx_line_is_stale).
+            // init_stereo_reverb() returns early if the lines already exist, so a
+            // re-enable without a realloc would otherwise replay the old room.
+            reverb_params_t *rev = amy_global.bus[bus]->reverb.rev;
+            if (rev != NULL && rev->delay_1 != NULL
+                    && fx_line_is_stale(amy_global.bus[bus]->reverb.disabled_at_block)) {
+                fx_flush_delay_line(rev->delay_1);
+                fx_flush_delay_line(rev->delay_2);
+                fx_flush_delay_line(rev->delay_3);
+                fx_flush_delay_line(rev->delay_4);
+                fx_flush_delay_line(rev->ref_1);
+                fx_flush_delay_line(rev->ref_2);
+                fx_flush_delay_line(rev->ref_3);
+                fx_flush_delay_line(rev->ref_4);
+                fx_flush_delay_line(rev->ref_5);
+                fx_flush_delay_line(rev->ref_6);
+                rev->f1state = 0;
+                rev->f2state = 0;
+                rev->f3state = 0;
+                rev->f4state = 0;
+            }
         }
         config_stereo_reverb(amy_global.bus[bus]->reverb.rev, liveness, xover_hz, damping);
+    } else if (old_level > 0) {
+        // >0 -> 0: remember when the lines froze.
+        amy_global.bus[bus]->reverb.disabled_at_block = amy_global.total_blocks;
     }
     amy_global.bus[bus]->reverb.level = F2S(level);
     amy_global.bus[bus]->reverb.liveness = liveness;
