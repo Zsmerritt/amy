@@ -565,6 +565,7 @@ void bus_reset(uint8_t bus) {
     config_eq(bus, F2S(1.0f), F2S(1.0f), F2S(1.0f));
     filters_init(bus);
     reset_parametric(bus);
+    amy_global.bus[bus]->eq.tail_blocks = 0;
 
     if (AMY_HAS_CHORUS) config_chorus(bus, CHORUS_DEFAULT_LEVEL, CHORUS_DEFAULT_MAX_DELAY, CHORUS_DEFAULT_LFO_FREQ, CHORUS_DEFAULT_MOD_DEPTH);
 #ifdef AMY_AUX_REVERB
@@ -2248,13 +2249,29 @@ int16_t * amy_fill_buffer() {
         // apply the eq filters if there is some signal and EQ is non-default.
     for (int bus=0; bus <= amy_global.highest_bus; ++bus) {
         uint32_t bit = 1u << bus;
-        if (!(bus_live & bit)) {
+        eq_state_t *beq = &amy_global.bus[bus]->eq;
+        uint8_t eq_on = (beq->eq[0] != F2S(1.0f) || beq->eq[1] != F2S(1.0f) || beq->eq[2] != F2S(1.0f));
+        uint8_t run_eq = 0;        // run the EQ over this bus this block
+        if (bus_live & bit) {
+            // Oscs sounded on this bus: run the EQ (if non-unity) and
+            // re-arm its silence countdown.
+            run_eq = eq_on;
+            if (eq_on) beq->tail_blocks = AMY_EQ_TAIL_BLOCKS;
+        } else {
             // No oscs played this bus. FX with STATE (chorus/echo delay
             // lines, EQ biquads, per-bus reverb) still carry an audible
             // tail and must keep advancing over a zero block; a bus with
-            // no active FX is skipped outright (OPT-11).
-            uint8_t fx_active =
-                (amy_global.bus[bus]->eq.eq[0] != F2S(1.0f) || amy_global.bus[bus]->eq.eq[1] != F2S(1.0f) || amy_global.bus[bus]->eq.eq[2] != F2S(1.0f))
+            // no active FX is skipped outright (OPT-11). The EQ biquads'
+            // zero-input tail collapses to a fixed point of the truncated
+            // iteration within a block or two (see AMY_EQ_TAIL_BLOCKS), so
+            // the EQ only counts as active FX while its countdown runs;
+            // after that it is skipped with its state frozen at that fixed
+            // point -- running it again would reproduce the same state and
+            // a zero block, so skipping is bit-identical to running, and
+            // it would otherwise burn a full 3-band pass per block
+            // filtering zeros into zeros.
+            uint8_t eq_tail = eq_on && beq->tail_blocks > 0;
+            uint8_t fx_active = eq_tail
                 || (AMY_HAS_CHORUS && amy_global.bus[bus]->chorus.level > 0 && amy_global.bus[bus]->chorus.chorus_delay_lines[0] != NULL)
                 || (AMY_HAS_ECHO && amy_global.bus[bus]->echo.level > 0 && amy_global.bus[bus]->echo.echo_delay_lines[0] != NULL)
 #if !defined(AMY_MASTER_REVERB) && !defined(AMY_AUX_REVERB)
@@ -2264,9 +2281,13 @@ int16_t * amy_fill_buffer() {
             if (!fx_active) continue;
             amy_block_zero(fbl[0][bus], AMY_BLOCK_SIZE * AMY_NCHANS);
             bus_live |= bit;
+            if (eq_tail) {
+                run_eq = 1;
+                beq->tail_blocks--;
+            }
         }
         // Per-bus EQ
-        if (amy_global.bus[bus]->eq.eq[0] != F2S(1.0f) || amy_global.bus[bus]->eq.eq[1] != F2S(1.0f) || amy_global.bus[bus]->eq.eq[2] != F2S(1.0f)) {
+        if (run_eq) {
             parametric_eq_process(bus, fbl[0][bus]);
         }
         if(AMY_HAS_CHORUS) {
