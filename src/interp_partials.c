@@ -38,10 +38,28 @@ const bool use_this_partial_map[MAX_NUM_HARMONICS] = {
     1, 0, 0, 0, 1, 0, 1, 0, 0, 0,  // 31-40
 };
 
+// Runtime partial-detail knob (OPT-8): harmonics at/above this index are
+// dropped in ADDITION to the static map. A sustained voice at full detail
+// runs ~24 partial oscs (~14% of a core); capping at 16 recovers roughly a
+// third of that for a subtle top-end change. Change it only while no
+// partials notes are held (note-off counts partials with the same rule).
+uint8_t amy_partials_harmonic_limit = MAX_NUM_HARMONICS;
+
+static inline bool use_partial(int h) {
+    return h < amy_partials_harmonic_limit && use_this_partial_map[h];
+}
+
 
 // choose a preset from the .h file
 void partials_note_on(uint16_t osc) {
     int num_partials = synth[osc]->preset;
+    // preset arrives unclamped from the wire ('p'), and we touch oscs
+    // osc+1..osc+num_partials -- clamp so we never index past synth[].
+    if (num_partials > AMY_OSCS - 1 - osc) {
+        fprintf(stderr, "partials_note_on: osc %d preset %d exceeds AMY_OSCS %d, clamping\n",
+                osc, num_partials, AMY_OSCS);
+        num_partials = (osc < AMY_OSCS - 1) ? (AMY_OSCS - 1 - osc) : 0;
+    }
     for (int i = 0; i < num_partials; ++i) {
         int o = osc + 1 + i;
         ensure_osc_allocd(o, NULL);
@@ -59,8 +77,11 @@ void partials_note_on(uint16_t osc) {
 
 void partials_note_off(uint16_t osc) {
     int num_oscs = synth[osc]->preset;
+    // Same clamp as partials_note_on: preset is unclamped wire data.
+    if (num_oscs > AMY_OSCS - 1 - osc) num_oscs = (osc < AMY_OSCS - 1) ? (AMY_OSCS - 1 - osc) : 0;
     for(uint16_t i = osc + 1; i < osc + 1 + num_oscs; i++) {
         uint16_t o = i % AMY_OSCS;
+        if (synth[o] == NULL) continue;
         AMY_UNSET(synth[o]->note_on_clock);
         synth[o]->note_off_clock = amy_global.total_blocks*AMY_BLOCK_SIZE;
     }
@@ -81,12 +102,15 @@ SAMPLE render_partials(SAMPLE *buf, uint16_t osc) {
         //num_oscs = partials_voice->num_harmonics[0];   // Assume first preset has the max #harmonics.
         num_oscs = interp_partials_max_partials_for_patch(synth[osc]->preset);
     }
+    // Same clamp as partials_note_on: preset is unclamped wire data.
+    if ((int)num_oscs > AMY_OSCS - 1 - osc) num_oscs = (osc < AMY_OSCS - 1) ? (AMY_OSCS - 1 - osc) : 0;
 
     // now, render everything, add it up
     float midi_note = midi_note_for_logfreq(msynth[osc]->logfreq);
     //fprintf(stderr, "t=%u partials o=%d msynth[osc]->logfreq=%f midi_note=%f msynth[amp]=%f\n", amy_global.total_blocks*AMY_BLOCK_SIZE, osc, msynth[osc]->logfreq, midi_note, msynth[osc]->amp);
     for(uint16_t i = osc + 1; i < osc + 1 + num_oscs; i++) {
         uint16_t o = i % AMY_OSCS;
+        if(synth[o] == NULL) continue;
         if(synth[o]->status ==SYNTH_IS_ALGO_SOURCE) {
             // We vary each partial's "velocity" on-the-fly as the way the parent osc's amplitude envelope contributes to the partials.
             synth[o]->velocity = msynth[osc]->amp;
@@ -110,7 +134,7 @@ SAMPLE render_partials(SAMPLE *buf, uint16_t osc) {
 int _max_partials_for_partials_voice(const interp_partials_voice_t *partials_voice) {
     int max_num_partials = 0;
     for (int h = 0; h < partials_voice->num_harmonics[0]; ++h) {
-        if (use_this_partial_map[h]) ++max_num_partials;
+        if (use_partial(h)) ++max_num_partials;
     }
     return max_num_partials;
 }
@@ -240,7 +264,7 @@ void interp_partials_note_on(uint16_t osc) {
     }
     int partial_osc = osc;
     for (int h = 0; h < num_harmonics; ++h) {
-        if (use_this_partial_map[h]) {
+        if (use_partial(h)) {
             for (int i = 0; i < MAX_NUM_MAGNITUDES + 1; ++i)  harm_param[i] = 0;
             _cumulate_scaled_harmonic_params(harm_param, harmonic_base_index_pl_vl + h,
                                              alpha_pl_vl, partials_voice);
@@ -264,7 +288,7 @@ void interp_partials_note_off(uint16_t osc) {
     //int num_oscs = partials_voice->num_harmonics[0];   // Assume first preset has the max #harmonics.
     int num_oscs = 0; //MAX_NUM_HARMONICS;
     // Actual max num harmonics we may use is the number of 1s in the use_this_partial_map.
-    for (int i = 0; i < MAX_NUM_HARMONICS; ++i) num_oscs += use_this_partial_map[i];
+    for (int i = 0; i < MAX_NUM_HARMONICS; ++i) num_oscs += use_partial(i) ? 1 : 0;
     for(uint16_t i = osc + 1; i < osc + 1 + num_oscs; i++) {
         uint16_t o = i % AMY_OSCS;
         if (synth[o]) {  // For high notes, some partials may be unused, unintialized (?)

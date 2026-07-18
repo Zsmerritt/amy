@@ -46,6 +46,33 @@ void midi_active_channels_reset(void);
 void midi_active_channel_set(uint8_t channel, bool state);
 void midi_active_channels_debug(void);
 
+// One parser context per MIDI byte STREAM. The stream parser keeps state
+// across calls (running status, collected data bytes, inside-sysex), so two
+// byte streams must never share a context -- and, in the default build, the
+// parser plus everything downstream of it may only run on the AMY MIDI task
+// (see amy_midi_inject). Spec and rationale: amy_midi_parse.h.
+typedef enum {
+    AMY_MIDI_SOURCE_UART = 0,  // DIN/UART, parsed directly by the MIDI task
+                               // (also the context behind the single-source
+                               // compatibility entry convert_midi_bytes_to_messages)
+    AMY_MIDI_SOURCE_USB_HOST,  // Tulip USB-host MIDI (packetized: usb flag 1)
+    AMY_MIDI_SOURCE_LOCAL,     // tulip.midi_local() from MicroPython (byte stream)
+    AMY_MIDI_SOURCE_GADGET,    // TinyUSB gadget MIDI (packetized), AMYBOARD
+    AMY_MIDI_SOURCE_COUNT
+} amy_midi_source_t;
+
+#ifdef ESP_PLATFORM
+// Hand bytes from a task that is NOT the AMY MIDI task to the MIDI input
+// path. Default build: enqueues into a small funnel queue drained by the
+// MIDI task within ~1ms -- never blocks; on a full/missing queue the bytes
+// are dropped LOUDLY (counted in amy_midi_inject_drops, logged on a
+// power-of-two schedule, readable from Python as tulip.midi_in_drops()).
+// AMY_MIDI_MPSC build: parses immediately in the caller's task using the
+// source's own context.
+void amy_midi_inject(amy_midi_source_t source, const uint8_t *bytes, uint16_t len);
+extern volatile uint32_t amy_midi_inject_drops;
+#endif
+
 
 #define MAX_MIDI_BYTES_TO_PARSE 1024
 #define MAX_MIDI_BYTES_PER_MESSAGE 3
@@ -83,10 +110,13 @@ extern uint8_t sysex_copy_write_idx;
 extern uint8_t sysex_copy_read_idx;
 extern uint16_t sysex_len;
 extern void parse_sysex();
-extern uint8_t last_midi[MIDI_QUEUE_DEPTH][MAX_MIDI_BYTES_PER_MESSAGE];
-extern uint8_t last_midi_len[MIDI_QUEUE_DEPTH];
-extern int16_t midi_queue_tail;
-extern int16_t midi_queue_head;
+// The last_midi ring -- last_midi, last_midi_len, midi_queue_head and
+// midi_queue_tail -- is NOT declared here. It is entirely tulip's: amy never
+// touches it (only comments in amy_midi.c refer to it), and tulip includes this
+// header only `#ifndef __EMSCRIPTEN__`, so declaring it here made it invisible
+// to the web build while the code using it still compiled. It now lives in
+// tulipcc tulip/shared/amy_connector.h, beside the amy_connector.c that defines
+// it and the MIDI_QUEUE_DEPTH/MAX_MIDI_BYTES_PER_MESSAGE that dimension it.
 
 void midi_out(uint8_t * bytes, uint16_t len);
 void midi_local(uint8_t * bytes, uint16_t len);
@@ -99,7 +129,12 @@ void amy_event_midi_message_received(uint8_t * data, uint32_t len, uint8_t sysex
 #define MIDI_TASK_COREID (0)
 #define MIDI_TASK_STACK_SIZE (8 * 1024)
 #define MIDI_TASK_NAME      "amy_midi_task"
-#define MIDI_TASK_PRIORITY (ESP_TASK_PRIO_MAX - 2)
+// BELOW the render tasks (review FW-5): at MAX-2 a sysex burst preempted
+// core-0 rendering for its whole parse -- the fill task then blocked on
+// the render notify and the entire audio pipeline stalled past the DMA
+// ring. One block (5.8ms) of MIDI latency is inaudible; a stalled block
+// is not.
+#define MIDI_TASK_PRIORITY (ESP_TASK_PRIO_MAX - 4)
 #endif
 
 void run_midi();

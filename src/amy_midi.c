@@ -15,6 +15,7 @@ extern void mp_usbd_task(void);
 #if defined(ESP_PLATFORM)
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/queue.h"
 #endif
 
 #if (defined ARDUINO_ARCH_RP2040) || (defined ARDUINO_ARCH_RP2350)
@@ -29,9 +30,14 @@ extern void mp_usbd_task(void);
 
 
 #include "amy_midi.h"
-uint8_t current_midi_message[3] = {0,0,0};
-uint8_t midi_message_slot = 0;
-uint8_t sysex_flag = 0;
+// Parser state (running status, data-byte slot, inside-sysex) lives in ONE
+// midi_stream_parser_t PER BYTE STREAM -- see midi_parsers[] below and the
+// spec in amy_midi_parse.h. It used to be three shared globals, which tore
+// messages whenever two sources (DIN + USB, or tulip.midi_local) arrived
+// concurrently: a running-status data byte from one stream completed a
+// message begun by the other.
+// external_midi_sync_mode (upstream's OFF/FOLLOW/SEND enum) supersedes our
+// fork's on/off boolean; the sync-follow/-send call sites all use the enum.
 static uint8_t external_midi_sync_mode = AMY_MIDI_SYNC_OFF;
 
 void amy_external_midi_sync(uint8_t mode) {
@@ -142,10 +148,89 @@ void amy_send_midi_note_off(uint16_t osc) {
     }
 }
 
+///// MPE (MIDI Polyphonic Expression)
+
+uint8_t amy_mpe_is_member_channel(uint8_t channel) {
+    mpe_state_t *mpe = &amy_global.mpe;
+    if (mpe->num_members == 0 || channel < 1 || channel > 16) return 0;
+    if (mpe->master_channel == 16)  // Upper zone: members descend from 15.
+        return (channel >= 16 - mpe->num_members) && (channel <= 15);
+    // Lower zone: members ascend from master+1.
+    return (channel >= mpe->master_channel + 1) && (channel <= mpe->master_channel + mpe->num_members);
+}
+
+// The synth that should handle a message on this channel: the zone master's
+// synth for member channels, otherwise the channel's own synth.
+uint8_t amy_mpe_synth_for_channel(uint8_t channel) {
+    if (amy_mpe_is_member_channel(channel)) return amy_global.mpe.master_channel;
+    return channel;
+}
+
+void amy_mpe_config(uint8_t master_channel, int num_members, float bend_range) {
+    mpe_state_t *mpe = &amy_global.mpe;
+    if (num_members < 0) num_members = 0;
+    if (num_members > 15) num_members = 15;
+    if (master_channel < 1 || master_channel > 16) {
+        // Callers pass the synth number as the zone master (parse.c iE routes
+        // through e->synth), and synths can be numbered past 16. A master
+        // outside 1-16 can never match a MIDI channel, so storing it would
+        // just leave a zone that silently never fires -- reject it instead.
+        fprintf(stderr, "amy_mpe_config: master channel %d out of range 1-16; ignoring\n",
+                master_channel);
+        return;
+    }
+    mpe->master_channel = master_channel;
+    mpe->num_members = num_members;
+    if (AMY_IS_SET(bend_range) && bend_range > 0) mpe->member_bend_range = bend_range;
+    for (int ch = 0; ch < 17; ++ch) {
+        mpe->channel_bend[ch] = 0;
+        mpe->channel_pressure[ch] = 0;
+        mpe->channel_timbre[ch] = 0;
+    }
+    //fprintf(stderr, "MPE: master %d members %d bend range %.1f\n", mpe->master_channel, mpe->num_members, mpe->member_bend_range);
+}
+
+void amy_mpe_reset(void) {
+    mpe_state_t *mpe = &amy_global.mpe;
+    mpe->num_members = 0;
+    mpe->master_channel = 1;
+    mpe->member_bend_range = MPE_DEFAULT_MEMBER_BEND_RANGE;
+    for (int ch = 0; ch < 17; ++ch) {
+        mpe->channel_bend[ch] = 0;
+        mpe->channel_pressure[ch] = 0;
+        mpe->channel_timbre[ch] = 0;
+        mpe->rpn_msb[ch] = 0x7F;  // Null RPN.
+        mpe->rpn_lsb[ch] = 0x7F;
+    }
+}
+
 void amy_received_control_change(uint8_t channel, uint8_t control, uint8_t value, uint32_t time) {
+    mpe_state_t *mpe = &amy_global.mpe;
     if (control == 0) {
         // Bank select coarse.
         instrument_set_bank_number(channel, value);
+    } else if (control == 74 && amy_mpe_is_member_channel(channel)) {
+        // MPE per-note timbre ("slide").
+        mpe->channel_timbre[channel] = (float)value / 127.0f;
+    } else if (control == 101) {
+        mpe->rpn_msb[channel] = value;
+    } else if (control == 100) {
+        mpe->rpn_lsb[channel] = value;
+    } else if (control == 6) {
+        // Data Entry MSB for the currently-selected RPN.
+        if (mpe->rpn_msb[channel] == 0 && mpe->rpn_lsb[channel] == 6
+            && (channel == 1 || channel == 16)) {
+            // MPE Configuration Message: sets/clears the zone whose master is this channel.
+            amy_mpe_config(channel, value, AMY_UNSET_FLOAT);
+        } else if (mpe->rpn_msb[channel] == 0 && mpe->rpn_lsb[channel] == 0
+                   && amy_mpe_is_member_channel(channel)) {
+            // Pitch bend sensitivity on a member channel sets the zone's member bend range.
+            // Spec deviation: the MPE spec also defines RPN 0 on the MASTER
+            // channel (master-channel bend range); we deliberately leave that
+            // to AMY's global pitch_bend handling and only honor member-channel
+            // sensitivity here.
+            mpe->member_bend_range = (float)value;
+        }
     }
 }
 
@@ -239,14 +324,36 @@ void amy_event_midi_message_received(uint8_t * data, uint32_t len, uint8_t sysex
     if(!sysex) {
         uint8_t status_byte = data[0];
         uint8_t channel = 1 + (status_byte & 0x0F);
-        if (_midi_channel_active[channel]) {
+        // MPE member channels route to the zone master's synth and usually have
+        // no instrument of their own, so they are NOT in _midi_channel_active.
+        // Admit them explicitly so per-note expression AND their notes (routed
+        // MPE-aware inside midi_message_handler_to_queue) are processed. When
+        // MPE is off amy_mpe_is_member_channel() is always false, so this is
+        // exactly upstream's active-channel gate.
+        if (_midi_channel_active[channel] || amy_mpe_is_member_channel(channel)) {
             uint8_t status = status_byte & 0xF0;
-            // Do the AMY instrument things here
-            if(status == 0xB0 && data[1] == 0x40) amy_received_pedal(channel, data[2], time);
-            else if(status == 0xB0 && data[1] == 0x7B) amy_received_all_notes_off(channel, time);
+            // Do the AMY instrument things here.
+            // Pedal and all-notes-off on an MPE member channel act on the zone's synth.
+            if(status == 0xB0 && data[1] == 0x40) amy_received_pedal(amy_mpe_synth_for_channel(channel), data[2], time);
+            else if(status == 0xB0 && data[1] == 0x7B) amy_received_all_notes_off(amy_mpe_synth_for_channel(channel), time);
             else if(status == 0XB0) amy_received_control_change(channel, data[1], data[2], time);
             else if(status == 0xC0) amy_received_program_change(channel, data[1], time);
-            else if(status == 0xE0) amy_received_pitch_bend(channel, data[1], data[2], time);
+            else if(status == 0xD0) {
+                // Channel pressure: per-note pressure on MPE member channels (read as ext0).
+                if (amy_mpe_is_member_channel(channel))
+                    amy_global.mpe.channel_pressure[channel] = (float)data[1] / 127.0f;
+            }
+            else if(status == 0xE0) {
+                if (amy_mpe_is_member_channel(channel)) {
+                    // MPE per-note pitch bend: applies only to this channel's notes,
+                    // scaled by the zone's bend range (semitones -> octaves).
+                    int bend = (int)((data[2] << 7) | data[1]) - 8192;
+                    amy_global.mpe.channel_bend[channel] =
+                        ((float)bend / 8192.0f) * (amy_global.mpe.member_bend_range / 12.0f);
+                } else {
+                    amy_received_pitch_bend(channel, data[1], data[2], time);
+                }
+            }
             // MIDI transport (Start/Stop) only drives the sequencer when the user
             // has opted into following external sync; otherwise a connected DAW's
             // transport would hijack the AMYboard's own internal sequence.
@@ -305,6 +412,9 @@ void midi_clock_received() {
 */
 
 uint16_t sysex_len = 0;
+// Latched when a sysex overruns sysex_buffer. The message is then dropped at
+// its closing F7 rather than truncated -- see convert_midi_bytes_to_messages().
+static uint8_t sysex_overflow = 0;
 #if defined(TULIP) || defined(AMYBOARD)
 extern const mp_obj_fun_builtin_var_t tulip_amy_send_sysex_obj;
 #endif
@@ -385,80 +495,36 @@ void parse_sysex() {
     }
 }
 
+// The parser core lives in amy_midi_parse.h so tulipcc's host concurrency
+// harness (tests/midi_input/) can compile the EXACT same code natively and
+// differential-test it. These macros bind it to the real firmware sinks.
+// Emitted messages carry an UNSET time, exactly like the old inline parser.
+#define AMY_MIDI_PARSE_EMIT(d, l) do { \
+        uint32_t t_ = 0; t_ = AMY_UNSET_VALUE(t_); \
+        amy_event_midi_message_received((d), (l), 0, t_); \
+    } while (0)
+#define AMY_MIDI_PARSE_CLOCK()      midi_clock_received()
+#define AMY_MIDI_PARSE_SYSEX_DONE() parse_sysex()
+#define AMY_MIDI_PARSE_LOG(...)     fprintf(stderr, __VA_ARGS__)
+#ifdef AMY_MIDI_MPSC
+#define AMY_MIDI_PARSE_MPSC 1
+#endif
+#include "amy_midi_parse.h"
+
+// One context per byte stream (see amy_midi_source_t). A context is only
+// ever advanced by one task: in the default funnel build that task is the
+// AMY MIDI task for ALL of them (foreign sources hand their bytes over via
+// amy_midi_inject); in the experimental AMY_MIDI_MPSC build each producer
+// task parses its own context in place.
+static midi_stream_parser_t midi_parsers[AMY_MIDI_SOURCE_COUNT];
+
 void convert_midi_bytes_to_messages(uint8_t * data, size_t len, uint8_t usb) {
-    // i take any amount of bytes and add messages 
-    // remember this can start in the middle of a midi message, so act accordingly
-    // running status is handled by keeping the status byte around after getting a message.
-    // remember that USB midi always comes in groups of 3 here, even if it's just a one byte message
-    // so we have USB (and mac IAC) set a usb flag so we know to end the loop once a message is parsed
-
-    uint32_t time = AMY_UNSET_VALUE(time);
-    for(size_t i=0;i<len;i++) {
-
-        uint8_t byte = data[i];
-
-        // Skip sysex in this parser until we get an F7. We do not pass sysex over to python (yet)
-        if(sysex_flag) {
-            if(byte == 0xF7) {
-                sysex_flag = 0;
-                parse_sysex();
-            } else {
-                sysex_buffer[sysex_len++] = byte;
-            }
-        } else {
-            if(byte & 0x80) { // new status byte
-                // System Real-Time messages (0xF8-0xFF) may be interleaved
-                // anywhere in the stream -- even between the data bytes of
-                // another message -- and must NOT disturb running status. So
-                // handle them with a scratch buffer, leaving current_midi_message[]
-                // and midi_message_slot untouched.
-                if(byte >= 0xF8) {
-                    if(byte == 0xF8) { // clock. don't forward this on to Tulip userspace
-                        midi_clock_received();
-                    } else { // start/continue/stop/active-sensing/reset/etc
-                        uint8_t rt[1] = { byte };
-                        amy_event_midi_message_received(rt, 1, 0, time);
-                    }
-                    if(usb) i = len+1; // exit the loop if usb
-                } else {
-                    // Channel Voice (0x80-0xE0) or System Common (0xF0-0xF7):
-                    // these begin a fresh message and cancel running status.
-                    sysex_flag = 0; sysex_len = 0;
-                    current_midi_message[0] = byte;
-                    midi_message_slot = 0; // drop any half-collected data bytes
-                    if(byte == 0xF4 || byte == 0xF5 || byte == 0xF6) {
-                        // 1-byte System Common (undefined / tune request)
-                        amy_event_midi_message_received(current_midi_message, 1, 0, time);
-                        if(usb) i = len+1; // exit the loop if usb
-                    } else if(byte == 0xF0) { // sysex start
-                        // everything is an AMY message until 0xF7
-                        sysex_flag = 1;
-                    }
-                    // else: channel voice or F1/F2/F3 -- status stored, await data bytes
-                }
-            } else { // data byte of some kind
-                uint8_t status = current_midi_message[0] & 0xF0;
-
-                // a 2 bytes of data message
-                if(status == 0x80 || status == 0x90 || status == 0xA0 || status == 0xB0 || status == 0xE0 || current_midi_message[0] == 0xF2) {
-                    if(midi_message_slot == 0) {
-                        current_midi_message[1] = byte;
-                        midi_message_slot = 1;
-                    } else {
-                        current_midi_message[2] = byte;
-                        midi_message_slot = 0;
-                        amy_event_midi_message_received(current_midi_message, 3, 0, time);
-                    }
-                // a 1 byte data message
-                } else if (status == 0xC0 || status == 0xD0 || current_midi_message[0] == 0xF3 || current_midi_message[0] == 0xF1) {
-                    current_midi_message[1] = byte;
-                    amy_event_midi_message_received(current_midi_message, 2, 0, time);
-                    if(usb) i = len+1; // exit the loop if usb
-                }
-            }
-        }
-    }
-    
+    // Single-stream compatibility entry -- and the UART/DIN path on ESP.
+    // Platforms with exactly one MIDI byte source (pico, teensy, macos, web)
+    // parse in the UART context. A SECOND concurrent source must NOT call
+    // this: on ESP it goes through amy_midi_inject() so both the parser
+    // context and the executing task match the stream.
+    midi_parse_stream(&midi_parsers[AMY_MIDI_SOURCE_UART], data, len, usb);
 }
 
 // This is used for web emscripten hooks + external linkers of AMY
@@ -504,6 +570,104 @@ void midi_out(uint8_t * bytes, uint16_t len) {
 #if (defined ESP_PLATFORM)
 TaskHandle_t midi_handle;
 
+// ---- Cross-task MIDI input funnel (default build) ----------------------
+// Everything downstream of the stream parser -- amy_add_event(), the MPE
+// globals, sequencer transport, parse_sysex()'s mp_sched hop, and Tulip's
+// last_midi ring (whose writer must be exactly ONE task for its SPSC
+// release/acquire discipline to mean anything) -- is single-threaded by
+// design. The UART already parses on the AMY MIDI task; the Tulip USB host
+// task (core 1) and MicroPython's tulip.midi_local() (MP task, core 1) used
+// to call the parser directly from their own tasks, racing all of it. They
+// now enqueue raw bytes here and the MIDI task drains the queue in
+// esp_poll_midi(): the single-writer invariant is restored rather than
+// defended against.
+//
+// Latency cost of the hop: the MIDI task's UART poll blocks at most one
+// FreeRTOS tick (1ms at CONFIG_FREERTOS_HZ=1000), so a funneled message
+// waits <=~1ms before parsing -- the same order as ONE message's own wire
+// time on DIN (3 bytes at 31250 baud = 960us) and far below perceptibility.
+//
+// SRAM cost: the queue struct and storage are allocated with
+// ram_caps_sysex (SPIRAM on Tulip) -- internal SRAM is designed-full on the
+// deck (28 bytes free, measured) and none of it may be spent here. Do NOT
+// swap this for xQueueCreate(): that puts the storage in internal heap.
+#ifndef AMY_MIDI_MPSC
+typedef struct {
+    uint8_t source;   // amy_midi_source_t: selects the parser context
+    uint8_t usb;      // packetized-source flag for the parser
+    uint8_t len;      // 1..3 bytes used
+    uint8_t bytes[3];
+} midi_inject_item_t;
+
+// 128 messages of backlog. The MIDI task drains the whole queue at least
+// once per ms, so overflow means >128 messages/ms sustained -- beyond what
+// MIDI hardware can produce; a full queue really means the MIDI task is
+// wedged, which the drop counter below makes visible instead of hiding.
+#define MIDI_INJECT_QUEUE_DEPTH 128
+static QueueHandle_t midi_inject_queue = NULL;
+#endif
+volatile uint32_t amy_midi_inject_drops = 0;
+
+static void midi_inject_report_drop(const char *why) {
+    uint32_t n = ++amy_midi_inject_drops;
+    // First drop logs immediately, then every power of two: loud enough to
+    // see the first failure the moment it happens, quiet enough that a
+    // wedged MIDI task doesn't turn the console into its own flood.
+    if ((n & (n - 1)) == 0)
+        fprintf(stderr, "amy_midi_inject: %s -- %u MIDI messages dropped so far\n",
+                why, (unsigned)n);
+}
+
+#ifdef AMY_MIDI_MPSC
+// ---- Experimental MPSC build: parse in the CALLER's task ----------------
+// Each source owns its parser context, so per-stream state is race-free by
+// construction; the shared sysex buffer is claimed by atomic CAS (see
+// amy_midi_parse.h); Tulip's last_midi ring must then be built MPSC too
+// (tulip/shared/midi_in_ring.h, same gate). What this build does NOT
+// serialize: the semantic layer under amy_event_midi_message_received()
+// (MPE state, bank select, sequencer transport, midi_msg_handler) now runs
+// concurrently from up to three tasks. See the harness verdict notes before
+// shipping this.
+void amy_midi_inject(amy_midi_source_t source, const uint8_t *bytes, uint16_t len) {
+    if (source >= AMY_MIDI_SOURCE_COUNT) { midi_inject_report_drop("bad source"); return; }
+    uint8_t usb = (source == AMY_MIDI_SOURCE_USB_HOST || source == AMY_MIDI_SOURCE_GADGET);
+    midi_parse_stream(&midi_parsers[source], (uint8_t *)bytes, len, usb);
+}
+#else
+void amy_midi_inject(amy_midi_source_t source, const uint8_t *bytes, uint16_t len) {
+    if (midi_inject_queue == NULL) {
+        // Not created yet, or its allocation failed at boot (already
+        // reported, loudly, by run_midi). Parsing here instead would be
+        // exactly the cross-task race this funnel exists to remove -- so
+        // drop, count, and say so.
+        midi_inject_report_drop("no queue");
+        return;
+    }
+    uint8_t usb = (source == AMY_MIDI_SOURCE_USB_HOST || source == AMY_MIDI_SOURCE_GADGET);
+    while (len) {
+        midi_inject_item_t it;
+        it.source = (uint8_t)source;
+        it.usb = usb;
+        it.len = (len > 3) ? 3 : (uint8_t)len;
+        for (uint8_t i = 0; i < it.len; i++) it.bytes[i] = bytes[i];
+        // Never block the caller: the USB event task and the MP task both
+        // have other work, and a wedged MIDI task must show up as counted
+        // drops, not as a second wedged task. Drop-NEWEST, matching the
+        // last_midi ring's discipline. NOTE: dropping mid-sysex can strand
+        // the shared sysex buffer with this source as owner until this
+        // source's next status byte -- acceptable only because a full queue
+        // already means the MIDI pipeline is down, and the drop counter
+        // says so.
+        if (xQueueSend(midi_inject_queue, &it, 0) != pdTRUE) {
+            midi_inject_report_drop("queue full");
+            return;  // the rest of this buffer is even newer: drop it too
+        }
+        bytes += it.len;
+        len -= it.len;
+    }
+}
+#endif
+
 int8_t esp_get_uart(int8_t index) {
     if(index==0) return UART_NUM_0;
     if(index==1) return UART_NUM_1;
@@ -523,7 +687,10 @@ void check_tusb_midi() {
     while ( tud_midi_available() ) {
         uint8_t packet[4];
         tud_midi_packet_read(packet);
-        convert_midi_bytes_to_messages(packet+1, 3, 1);
+        // Own context: this runs on the MIDI task right next to the UART
+        // poll, but it is a DIFFERENT byte stream -- sharing the UART's
+        // parser context interleaved gadget packets into DIN running status.
+        midi_parse_stream(&midi_parsers[AMY_MIDI_SOURCE_GADGET], packet+1, 3, 1);
     }
 }
 #endif
@@ -583,6 +750,23 @@ void esp_poll_midi(void) {
     if(length > 0) {
         convert_midi_bytes_to_messages(data,length,0);
     }
+#ifndef AMY_MIDI_MPSC
+    // Drain the cross-task funnel (USB-host MIDI, tulip.midi_local). Each
+    // item parses in ITS source's context, so streams can't tear each other
+    // even though one task parses them all. Budgeted to one queue-depth per
+    // pass so a producer flood can never starve the UART read above -- at
+    // this drain rate (>= once per ms) the budget is unreachable in normal
+    // operation.
+    if (midi_inject_queue != NULL) {
+        midi_inject_item_t it;
+        int budget = MIDI_INJECT_QUEUE_DEPTH;
+        while (budget-- > 0 && xQueueReceive(midi_inject_queue, &it, 0) == pdTRUE) {
+            uint8_t src = (it.source < AMY_MIDI_SOURCE_COUNT) ? it.source
+                                                              : AMY_MIDI_SOURCE_LOCAL;
+            midi_parse_stream(&midi_parsers[src], it.bytes, it.len, it.usb);
+        }
+    }
+#endif
 }
 
 void run_midi_task() {
@@ -596,6 +780,33 @@ void run_midi_task() {
 }
 
 void run_midi() {
+#ifndef AMY_MIDI_MPSC
+    // Create the inject funnel BEFORE any producer can run. Created once and
+    // deliberately never destroyed (see stop_midi): the producers live on
+    // OTHER tasks and cannot be fenced away from a freed queue -- a stale
+    // xQueueSend into freed memory is a heap smash. Cost: ~850 bytes of
+    // ram_caps_sysex (SPIRAM on Tulip), zero internal SRAM, held for life.
+    if (midi_inject_queue == NULL) {
+        StaticQueue_t *qs = (StaticQueue_t *)malloc_caps(sizeof(StaticQueue_t),
+                                                amy_global.config.ram_caps_sysex);
+        uint8_t *storage = (uint8_t *)malloc_caps(
+                MIDI_INJECT_QUEUE_DEPTH * sizeof(midi_inject_item_t),
+                amy_global.config.ram_caps_sysex);
+        if (qs != NULL && storage != NULL) {
+            midi_inject_queue = xQueueCreateStatic(MIDI_INJECT_QUEUE_DEPTH,
+                    sizeof(midi_inject_item_t), storage, qs);
+        }
+        if (midi_inject_queue == NULL) {
+            // Boot-time, once, unmissable: without the queue every USB-MIDI
+            // and midi_local message is dropped (and counted -- see
+            // amy_midi_inject_drops / tulip.midi_in_drops()).
+            fprintf(stderr, "run_midi: FAILED to allocate the MIDI inject queue "
+                    "(%u bytes) -- USB and midi_local input will be DROPPED\n",
+                    (unsigned)(sizeof(StaticQueue_t)
+                               + MIDI_INJECT_QUEUE_DEPTH * sizeof(midi_inject_item_t)));
+        }
+    }
+#endif
     if (sysex_buffer == NULL) {
         sysex_buffer = malloc_caps(MAX_SYSEX_BYTES, amy_global.config.ram_caps_sysex);
         for (int i = 0; i < SYSEX_COPY_SLOTS; i++) {

@@ -445,6 +445,14 @@ int amy_parse_synth_layer_message(char *message, amy_event *e) {
     char cmd = message[0];
     message++;
     if (cmd == 'd')  e->synth_delay_ms = atoi(message);
+    else if (cmd == 'E') {
+        // MPE zone config: iE<num_members>[,<bend_range_semitones>].
+        // Master channel is the event's synth; 0 members turns MPE off.
+        e->mpe_members = atoi(message);
+        const char *p = message;
+        while (*p && !isalpha((unsigned char)*p) && *p != ',') ++p;
+        if (*p == ',') e->mpe_bend_range = atoff((char *)(p + 1));
+    }
     else if (cmd == 'f')  e->synth_flags = atoi(message);
     else if (cmd == 'g')  skip_chars = cv_trigger_from_message(message, e->synth, skip_chars);
     else if (cmd == 'm')  e->grab_midi_notes = atoi(message);
@@ -730,7 +738,7 @@ int amy_parse_message(char * message, amy_event *e) {
             case 'i': pos += amy_parse_synth_layer_message(arg, e); break;  // Skip over second cmd letter, if any, or entire MIDI CC code string.
             case 'I': e->ratio = atoff(arg); break;
             case 'j': e->tempo = atoff(arg); break;
-            /* J available */
+            case 'J': e->mod1_source = atoi(arg); break;
             // chorus.level
             case 'k': if(AMY_HAS_CHORUS) {
                 float chorus_params[4];
@@ -761,7 +769,7 @@ int amy_parse_message(char * message, amy_event *e) {
             case 'O': parse_algo_source(arg, e->algo_source); break;
             case 'p': e->preset=atoi(arg); break;
             case 'P': e->trigger_phase=atoff(arg); break;
-            /* q unused */
+            case 'q': e->reverb_send = atoff(arg); break;  // aux-send spike
             case 'Q': parse_coef_message(arg, e->pan_coefs); break;
             case 'r': parse_voices(arg, e->voices); break;
             case 'R': e->resonance=atoff(arg); break;
@@ -806,7 +814,7 @@ int amy_parse_message(char * message, amy_event *e) {
                 }
                 break;
             case 'y': e->bus = atoi(arg); break;
-            /* Y still available */
+            case 'Y': e->sync_source = atoi(arg); break;
             case 'z': {
                 pos += amy_parse_transfer_layer_message(arg);
                 break;

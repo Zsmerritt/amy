@@ -156,14 +156,16 @@ _KW_MAP_LIST = [   # Order matters because patch_string must come last.
     ('bp0', 'AL'), ('bp1', 'BL'),
     ('eg0', 'AL'), ('eg1', 'BL'),  # Aliases for bp0 and bp1
     ('eg0_type', 'TI'), ('eg1_type', 'XI'), ('debug', 'DI'), ('chained_osc', 'cI'),
-    ('mod_source', 'LI'),  ('eq', 'xL'), ('filter_type', 'GI'), ('ratio', 'IF'), ('latency_ms', 'NI'),
+    ('mod_source', 'LI'), ('mod1_source', 'JI'), ('sync_source', 'YI'),
+    ('eq', 'xL'), ('filter_type', 'GI'), ('ratio', 'IF'), ('latency_ms', 'NI'),
     ('algo_source', 'OL'), ('load_sample', 'zL'), ('transfer_file', 'zTL'), ('disk_sample', 'zFL'), 
-    ('algorithm', 'oI'), ('chorus', 'kL'), ('reverb', 'hL'), ('echo', 'ML'), ('patch', 'KI'), ('voices', 'rL'),
+    ('algorithm', 'oI'), ('chorus', 'kL'), ('reverb', 'hL'), ('reverb_send', 'qF'), ('echo', 'ML'), ('patch', 'KI'), ('voices', 'rL'),
     ('external_channel', 'WI'), ('portamento', 'mI'), ('sequence', 'HL'), ('tempo', 'jF'), ('sequencer_run', 'zYI'),
     ('external_midi_sync', 'zCI'),
     ('synth', 'iI'), ('pedal', 'ipI'), ('synth_flags', 'ifI'), ('num_voices', 'ivI'), ('oscs_per_voice', 'inI'),
     ('synth_level', 'iVF'),
     ('to_synth', 'itI'), ('grab_midi_notes', 'imI'),  ('note_source_channel', 'iMI'), ('synth_delay', 'idI'),
+    ('mpe', 'iEL'),  # MPE zone config: "num_members[,bend_range_semitones]", master channel = synth
     ('preset', 'pI'), ('num_partials', 'pI'), # note aliasing
     ('start_sample', 'zSL'), ('stop_sample', 'zOI'),
     ('bus', 'yI'),

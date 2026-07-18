@@ -109,7 +109,60 @@ extern const uint32_t pcm_wavetable_len;
 // Until the pointer is set those presets are silently unavailable.
 extern const int16_t * gamma9001_pcm;
 extern void amy_set_gamma9001_pcm(const int16_t * data);
+extern void amy_set_gm_pcm(const int16_t * data);
+extern void amy_set_gm_big_pcm(const int16_t * data);
+
+// Flash fence (see pcm.c): platform sets [lo, hi) to its memory-mapped flash
+// window and raises the fence around filesystem writes; PCM renders whose
+// samples live in the window emit silence (phase held) while it is up, so a
+// flash program/erase can never race a mapped sample fetch.
+extern volatile uint8_t amy_flash_fence;
+extern const void *amy_flash_fence_lo;
+extern const void *amy_flash_fence_hi;
+
+// Runtime partial-detail knob for the interp-partials (piano) engine
+// (see interp_partials.c): harmonics at/above this index are dropped.
+// Change only while no partials notes are held.
+extern uint8_t amy_partials_harmonic_limit;
+
+// Oscs below this floor are never auto-allocated to patch voices -- for hosts
+// that drive low-numbered oscs directly alongside the patch/instrument layer.
+extern uint16_t amy_reserved_oscs;
 #endif
+
+// Register only a sub-window of the big GM bank (GM_FONTS builds): `data`
+// points at blob sample `first_sample`, and blob samples [first_sample,
+// first_sample + num_samples) are the only addressable ones. Presets whose
+// samples fall outside the window resolve to NULL (silent) instead of
+// dereferencing an unmapped address (see pcm.c range guard).
+// amy_set_gm_big_pcm(data) == window(data, 0, GM_BIG_BIN_FRAMES).
+extern void amy_set_gm_big_pcm_window(const int16_t * data,
+                                      uint32_t first_sample,
+                                      uint32_t num_samples);
+
+// Real sizes, in BYTES, of the raw int16 PCM bank blobs the platform provides
+// (sounds/gm/fonts.bin, sounds/gm/fonts_big.bin, drums.bin). Platforms that
+// esp_partition_mmap the blobs out of flash must map these sizes, NOT the
+// partition size: the ESP32-S3 has only 256 64KB data-mmap pages and the
+// partition slices round up past what exists. pcm.c compile-time-checks each
+// value against its map header (2 * *_BIN_FRAMES), so these can't silently
+// drift from the baked maps.
+#define AMY_GM_PCM_BYTES        3617870u  /* == 2 * GM_BIN_FRAMES        */
+#define AMY_GM_BIG_PCM_BYTES    9932684u  /* == 2 * GM_BIG_BIN_FRAMES    */
+#define AMY_GAMMA9001_PCM_BYTES 3735788u  /* == 2 * GAMMA9001_BIN_FRAMES */
+
+// The emu4 font's sample window inside the big bank, in int16 samples from
+// the blob start: [FIRST, END). Presets 1903..2060 -- the only big-bank
+// presets read on-device (tulipcc deck/gmbig.py: "Only the emu4 font is read
+// on-device") -- live exactly here: gm_big_map[1903 - GM_BIG_PRESET_BASE]
+// .offset == FIRST and gm_big_map[2060 - GM_BIG_PRESET_BASE].offset + length
+// == END. amy_set_gm_big_pcm_window re-verifies that against the baked map
+// at registration time and disables the bank (silent + logged) on mismatch,
+// so a rebake can't make a stale window play garbage. Platforms short on
+// mmap vaddr map just this byte range (2*FIRST .. 2*END of the blob) and
+// register it via amy_set_gm_big_pcm_window(map, FIRST, END - FIRST).
+#define AMY_GM_BIG_EMU4_FIRST_SAMPLE 4033544u
+#define AMY_GM_BIG_EMU4_END_SAMPLE   4681049u
 
 // File-streaming buffer size multiplier (in blocks).
 #define PCM_FILE_BUFFER_MULT 8
@@ -204,6 +257,26 @@ extern void amy_set_gamma9001_pcm(const int16_t * data);
 #define EQ_CENTER_MED 2500.0
 #define EQ_CENTER_HIGH 7000.0
 
+// How many blocks to keep running a bus's EQ after the bus stops sounding,
+// before skipping the EQ (state frozen) until oscs return. The EQ poles are
+// fixed by the three EQ_CENTER filters (the band gains only scale each
+// stage's zeros/forward gain, so user EQ settings cannot slow the decay);
+// the slowest is the 800 Hz Q=0.707 low band, pole radius ~0.92 => the
+// zero-input tail loses >180 dB per 256-sample block. Measured on the host
+// render harness, one silent block collapses the state to a period-1 fixed
+// point of the truncated biquad iteration (|entries| <= 3 counts ~ -153
+// dBFS) that further zero blocks reproduce exactly -- so freezing it there
+// and skipping is bit-identical to running. 8 blocks (~46 ms at 44.1k) is
+// an 8x margin on the measured settling time.
+#define AMY_EQ_TAIL_BLOCKS 8
+
+// Runtime A/B switch for the silent-bus EQ skip above. 1 (default): skip
+// enabled -- a silent bus's EQ stops after AMY_EQ_TAIL_BLOCKS, state frozen.
+// 0: skip disabled -- non-unity EQ keeps running over zero blocks forever,
+// exactly the pre-skip behavior. Safe to flip at any time from another task
+// (single byte, sampled once per bus per block by amy_fill_buffer).
+extern volatile uint8_t amy_eq_silent_skip;
+
 // reverb setup
 #define REVERB_DEFAULT_LEVEL 0
 #define REVERB_DEFAULT_LIVENESS 0.85f
@@ -217,6 +290,11 @@ extern void amy_set_gamma9001_pcm(const int16_t * data);
 #define ECHO_DEFAULT_MAX_DELAY_MS 743.039f
 #define ECHO_DEFAULT_FEEDBACK 0
 #define ECHO_DEFAULT_FILTER_COEF 0
+
+// FX with level 0 are skipped, not advanced, so their delay lines freeze with old
+// audio. (~1 s at 256/44100; a level that has been 0 longer than this flushes the
+// frozen line on re-enable.)
+#define FX_STALE_FLUSH_BLOCKS 172
 
 #define AMY_SEQUENCER_PPQ 48
 
@@ -258,7 +336,9 @@ typedef int16_t output_sample_type;
 #define ZERO_MIDI_NOTE 69  // 60
 #define MIN_FILTER_LOGFREQ -2.75f  // -2.0  // LPF cutoff cannot go below w = 0.01 rad/samp in filters.c = 72 Hz, so clip it here at ~65 Hz.
 
-#define NUM_COMBO_COEFS 9  // 9 control-mixing params: const, note, velocity, env1, env2, mod, pitchbend, ext0, ext1
+// COEF_MOD1 is appended after the original nine so every existing positional
+// coef string (up to ext1 at index 8) keeps its meaning.
+#define NUM_COMBO_COEFS 10  // 10 control-mixing params: const, note, velocity, env1, env2, mod, pitchbend, ext0, ext1, mod1
 enum coefs{
     COEF_CONST = 0,
     COEF_NOTE = 1,
@@ -269,6 +349,7 @@ enum coefs{
     COEF_BEND = 6,
     COEF_EXT0 = 7,
     COEF_EXT1 = 8,
+    COEF_MOD1 = 9,
 };
 
 #define MAX_MESSAGE_LEN 1024
@@ -347,6 +428,30 @@ enum coefs{
 #define SYNTH_FLAGS_IGNORE_NOTE_OFFS 2  // Note offs are ignored (for drums with long decays)
 #define SYNTH_FLAGS_NEGATE_PEDAL 4      // Flip interpretation of MIDI pedals
 
+// MPE (MIDI Polyphonic Expression) zone state.
+// When num_members > 0, notes arriving on the zone's member channels are routed
+// to the master channel's synth, and each member channel's pitch bend (0xE0),
+// channel pressure (0xD0), and CC74 (timbre) apply per-note to the voices whose
+// notes arrived on that channel (via each osc's note_source_channel).
+// Default MPE member-channel pitch bend range in semitones, per the MPE spec.
+// (No 'f' suffix or trailing comment: this line is scraped into amy/constants.py.)
+#define MPE_DEFAULT_MEMBER_BEND_RANGE 48.0
+typedef struct mpe_state {
+    uint8_t num_members;      // 0 = MPE off.  1-15 member channels.
+    uint8_t master_channel;   // 1 (lower zone) or 16 (upper zone).
+    float member_bend_range;  // semitones for full-scale member-channel bend.
+    // Per-MIDI-channel expression, 1-indexed by channel.  Written by the MIDI
+    // task, read by the render loop once per block (single-word float writes,
+    // same discipline as amy_global.pitch_bend).
+    float channel_bend[17];      // in octaves, like amy_global.pitch_bend.
+    float channel_pressure[17];  // 0..1, read as ext0 by member-note oscs.
+    float channel_timbre[17];    // 0..1 (CC74), read as ext1 by member-note oscs.
+    // RPN state machine (CC101/CC100), per channel, for MPE Config (RPN 6) and
+    // pitch bend sensitivity (RPN 0).
+    uint8_t rpn_msb[17];
+    uint8_t rpn_lsb[17];
+} mpe_state_t;
+
 #define true 1
 #define false 0
 
@@ -373,21 +478,23 @@ typedef int amy_err_t;
 
 enum params{
     WAVE, PRESET, MIDI_NOTE,              // 0, 1, 2
-    AMP,                                 // 3..11
-    DUTY=AMP + NUM_COMBO_COEFS,          // 12..20
-    FEEDBACK=DUTY + NUM_COMBO_COEFS,     // 21
-    FREQ,                                // 22..30
-    VELOCITY=FREQ + NUM_COMBO_COEFS,     // 31
-    PHASE, DETUNE, PITCH_BEND,           // 32, 33, 34
-    PAN,                                 // 35..43
-    FILTER_FREQ=PAN + NUM_COMBO_COEFS,   // 44..52
-    RATIO=FILTER_FREQ + NUM_COMBO_COEFS, // 53
-    RESONANCE, PORTAMENTO, CHAINED_OSC,  // 54, 55, 56
-    MOD_SOURCE, FILTER_TYPE,             // 57, 58
-    EQ_L, EQ_M, EQ_H,                    // 59, 60, 61
-    ALGORITHM, LATENCY, TEMPO,           // 62, 63, 64
-    VOLUME_BASE,                         // 65..68
-    VOLUME_END=VOLUME_BASE + AMY_NUM_BUSES, // 69
+    AMP,                                 // 3..12
+    DUTY=AMP + NUM_COMBO_COEFS,          // 13..22
+    FEEDBACK=DUTY + NUM_COMBO_COEFS,     // 23
+    FREQ,                                // 24..33
+    VELOCITY=FREQ + NUM_COMBO_COEFS,     // 34
+    PHASE, DETUNE, PITCH_BEND,           // 35, 36, 37
+    PAN,                                 // 38..47
+    FILTER_FREQ=PAN + NUM_COMBO_COEFS,   // 48..57
+    RATIO=FILTER_FREQ + NUM_COMBO_COEFS, // 58
+    RESONANCE, PORTAMENTO, CHAINED_OSC,  // 59, 60, 61
+    MOD_SOURCE, FILTER_TYPE,             // 62, 63
+    EQ_L, EQ_M, EQ_H,                    // 64, 65, 66
+    ALGORITHM, LATENCY, TEMPO,           // 67, 68, 69
+    VOLUME_BASE,                         // 70..73
+    VOLUME_END=VOLUME_BASE + AMY_NUM_BUSES, // 74
+    SYNC_SOURCE, MOD1_SOURCE,            // 75, 76
+    REVERB_SEND,                         // 77 (aux-send spike)
     ALGO_SOURCE_START=100,               // 100..105
     ALGO_SOURCE_END=100+MAX_ALGO_OPS,    // 106
     BP_START=ALGO_SOURCE_END + 1,        // 107..202
@@ -423,7 +530,7 @@ enum itags{
     FILTER_PROCESS_STAGE1, ADD_DELTA_TO_QUEUE, AMY_ADD_DELTA, PLAY_DELTA,  MIX_WITH_PAN, AMY_RENDER, 
     AMY_EXECUTE_DELTAS, AMY_FILL_BUFFER, RENDER_LUT_FM, RENDER_LUT_FB, RENDER_LUT, 
     RENDER_LUT_CUB, RENDER_LUT_FM_FB, RENDER_LPF_LUT, DSPS_BIQUAD_F32_ANSI_SPLIT_FB, DSPS_BIQUAD_F32_ANSI_SPLIT_FB_TWICE, DSPS_BIQUAD_F32_ANSI_COMMUTED, 
-    PARAMETRIC_EQ_PROCESS, HPF_BUF, SCAN_MAX, DSPS_BIQUAD_F32_ANSI, BLOCK_NORM, CALIBRATE, AMY_ESP_FILL_BUFFER, NO_TAG
+    PARAMETRIC_EQ_PROCESS, HPF_BUF, SCAN_MAX, DSPS_BIQUAD_F32_ANSI, BLOCK_NORM, CALIBRATE, AMY_ESP_FILL_BUFFER, STEREO_REVERB_PASS, AMY_FILL_POST, NO_TAG
 };
 struct profile {
     uint32_t calls;
@@ -446,13 +553,16 @@ extern uint64_t profile_start_us;
     profiles[tag].us_total += (amy_get_us()-profiles[tag].start); \
     profiles[tag].calls++;
 
+// newlib-NANO (the ESP-IDF default libc) has no 64-bit printf support:
+// %llu / PRIu64 emit the literal letters ("luus" instead of the numbers).
+// Totals fit 32 bits for any practical profiling window; cast explicitly.
 #define AMY_PROFILE_PRINT(tag) \
     if(profiles[tag].calls) {\
-        fprintf(stderr,"%40s: %10"PRIu32" calls %10"PRIu64"us total [%6.2f%% wall %6.2f%% render] %9"PRIu64"us per call\n", \
-        profile_tag_name(tag), profiles[tag].calls, profiles[tag].us_total, \
+        fprintf(stderr,"%40s: %10lu calls %10luus total [%6.2f%% wall %6.2f%% render] %9luus per call\n", \
+        profile_tag_name(tag), (unsigned long)profiles[tag].calls, (unsigned long)profiles[tag].us_total, \
         ((float)(profiles[tag].us_total) / (float)(amy_get_us() - profile_start_us))*100.0, \
         ((float)(profiles[tag].us_total) / (float)(profiles[AMY_RENDER].us_total))*100.0, \
-        (profiles[tag].us_total)/profiles[tag].calls);\
+        (unsigned long)((profiles[tag].us_total)/profiles[tag].calls));\
     }
 
 extern struct profile profiles[NO_TAG];
@@ -552,11 +662,14 @@ typedef struct amy_event {
     uint16_t portamento_ms;  // synth is alpha
     uint16_t chained_osc;
     uint16_t mod_source;
+    uint16_t mod1_source;
+    uint16_t sync_source;
     uint8_t algorithm;
     uint8_t filter_type;
     float eq_l;  // not in synth
     float eq_m;  // not in synth
     float eq_h;  // not in synth
+    float reverb_send;  // aux-send spike: per-bus send into the shared room
     uint16_t bp_is_set[MAX_BREAKPOINT_SETS];
     // Convert these two at least to vectors of ints, save several hundred bytes
     int16_t algo_source[MAX_ALGO_OPS];
@@ -574,6 +687,8 @@ typedef struct amy_event {
     uint8_t to_synth;  // For moving setup between synth numbers.
     uint8_t grab_midi_notes;  // To enable/disable automatic MIDI note-on/off generating note-on/off.
     uint8_t pedal;  // MIDI pedal value.
+    int16_t mpe_members;  // MPE zone config: number of member channels (0 = off).  Master channel is e->synth.
+    float mpe_bend_range;  // MPE member-channel pitch bend range in semitones (default 48).
     uint16_t num_voices;
     uint8_t oscs_per_voice;  // Used when initializing a synth without a patch.
     //
@@ -622,8 +737,10 @@ struct synthinfo {
     uint8_t filter_type;
     uint16_t chained_osc;
     uint16_t mod_source;
+    uint16_t mod1_source;
+    uint16_t sync_source;  // osc whose phase wrap hard-resets this osc's phase
     uint8_t algorithm;
-    int16_t algo_source[MAX_ALGO_OPS];  // int16 not uint because -1 specified to indicate no osc 
+    int16_t algo_source[MAX_ALGO_OPS];  // int16 not uint because -1 specified to indicate no osc
     uint8_t eg_type[MAX_BREAKPOINT_SETS];  // one of the ENVELOPE_ values
     uint8_t max_num_breakpoints[MAX_BREAKPOINT_SETS];  // alloc'd length of breakpoint_times/vals
     uint32_t *breakpoint_times[MAX_BREAKPOINT_SETS];  // (in samples) dynamically sized.
@@ -641,6 +758,8 @@ struct synthinfo {
     uint32_t note_off_clock;
     uint32_t mod_value_clock;  // Only calculate mod_value once per frame (for mod_source).
     SAMPLE mod_value;  // last value returned by this oscillator when acting as a MOD_SOURCE, not in event
+    SAMPLE pcm_last_out;   // last output value this PCM osc rendered (post-amp), for declick
+    SAMPLE pcm_declick;    // decaying offset canceling PCM waveform discontinuities
     SAMPLE last_scale[MAX_BREAKPOINT_SETS];  // remembers current envelope level, to use as start point in release.
     SAMPLE last_two[2];    // For ALGO feedback ops
     // For filters.  Need 2x because LPF24 uses two instances of filter.
@@ -804,6 +923,12 @@ typedef struct eq_state {
     SAMPLE eq[3];
     SAMPLE ** eq_coeffs;
     SAMPLE *** eq_delay;
+    // Silence countdown: re-armed to AMY_EQ_TAIL_BLOCKS every block the bus
+    // has audible oscs; decremented on keep-alive (osc-silent) blocks. When
+    // it hits 0 the EQ is skipped (biquad state frozen at its zero-input
+    // fixed point) until the bus sounds again. Written only by
+    // amy_fill_buffer (fill task).
+    uint8_t tail_blocks;
 } eq_state_t;
 
 typedef struct reverb_params {
@@ -817,6 +942,7 @@ typedef struct reverb_params {
 
 typedef struct reverb_state {
     SAMPLE level;
+    uint32_t disabled_at_block;  // total_blocks when level last went >0 -> 0.
     float liveness;
     float damping;
     float xover_hz;
@@ -825,6 +951,7 @@ typedef struct reverb_state {
 
 typedef struct chorus_config {
     SAMPLE level;     // How much of the delayed signal to mix in to the output, typ F2S(0.5).
+    uint32_t disabled_at_block;  // total_blocks when level last went >0 -> 0.
     int32_t max_delay;    // Max delay when modulating.  Must be <= DELAY_LINE_LEN
     float lfo_freq;
     float depth;
@@ -834,6 +961,7 @@ typedef struct chorus_config {
 
 typedef struct echo_config {
     SAMPLE level;  // Mix of echo into output.  0 = Echo off.
+    uint32_t disabled_at_block;  // total_blocks when level last went >0 -> 0.
     uint32_t delay_samples;  // Current delay, quantized to samples.
     uint32_t max_delay_samples;  // Maximum delay, i.e. size of allocated delay line.
     SAMPLE feedback;  // Gain applied when feeding back output to input.
@@ -847,6 +975,9 @@ typedef struct bus_state {
     // State of fixed dc-blocking HPF
     eq_state_t eq;
     reverb_state_t reverb;
+    // AUX-SEND SPIKE: how much of this bus's post-fader signal feeds the
+    // shared reverb return (1.0 default = today's master-room behavior).
+    float reverb_send;
     chorus_config_t chorus;
     echo_config_t echo;
 } bus_state_t;
@@ -858,6 +989,7 @@ typedef struct global_state {
     uint8_t i2s_is_in_background;  // Flag not to handle I2S in amy_update.
     float volume[AMY_NUM_BUSES];  // Volume controls mix of buses into final output.
     float pitch_bend;  // Legacy global pitch bend, will be subsumed per-synth (instrument).
+    mpe_state_t mpe;  // MPE zone config + per-channel expression.
     
     uint16_t delta_qsize;
     struct delta * delta_queue; // start of the sorted queue of deltas to execute.
@@ -1057,6 +1189,13 @@ extern void midi_msg_handler(uint8_t * bytes, uint16_t len, uint8_t is_sysex_unu
 extern void midi_message_handler_to_queue(uint8_t * bytes, uint16_t len, uint32_t time, amy_event *base_event, struct delta **queue);
 // Generator function for midi_message_handler.  Returns series of modified events while state is returned non-NULL.
 extern void *yield_midi_message_handler_events(uint8_t * bytes, uint16_t len, uint32_t time, amy_event *event, void *state);
+// MPE (see mpe_state_t).  Channel args are 1-based MIDI channels.
+extern uint8_t amy_mpe_is_member_channel(uint8_t channel);
+extern uint8_t amy_mpe_synth_for_channel(uint8_t channel);
+extern void amy_mpe_config(uint8_t master_channel, int num_members, float bend_range);
+extern void amy_mpe_reset(void);
+// Output peak (0..1) since the last call -- UI level meters. Reading resets it.
+extern float amy_get_level(void);
 
 extern float cv_inputs[AMY_MAX_CV_IN];
 #ifdef __EMSCRIPTEN__
@@ -1226,9 +1365,15 @@ extern SAMPLE scan_max(SAMPLE* block, int len);
 #define AMY_RENDER_TASK_PRIORITY (ESP_TASK_PRIO_MAX - 5)
 #define AMY_FILL_BUFFER_TASK_PRIORITY (ESP_TASK_PRIO_MAX - 5)
 #else
-// (ESP_TASK_PRIO_MAX - 1) is the highest available priority under FreeRTOS (at least in esp-idf 6.0).
-#define AMY_RENDER_TASK_PRIORITY (ESP_TASK_PRIO_MAX - 1)
-#define AMY_FILL_BUFFER_TASK_PRIORITY (ESP_TASK_PRIO_MAX - 1)
+// TWO below max, not one: at (MAX-1) these tied ESP-IDF's flash-guard IPC
+// task, so during a flash program/erase the guard could not reliably park
+// them -- an AMY task then touched cache-disabled address space and wedged
+// the chip (dual-core TG1WDT; flaky, worse when littlefs runs repair-erase
+// chains). At (MAX-3) the IPC task always preempts, the guard parks AMY for
+// the few ms of the write, and the I2S DMA ring absorbs the stall. Still
+// above every UI/app task, so audio keeps its priority over rendering.
+#define AMY_RENDER_TASK_PRIORITY (ESP_TASK_PRIO_MAX - 3)
+#define AMY_FILL_BUFFER_TASK_PRIORITY (ESP_TASK_PRIO_MAX - 3)
 #endif
 #define AMY_RENDER_TASK_COREID (0)
 #define AMY_FILL_BUFFER_TASK_COREID (1)
@@ -1242,6 +1387,7 @@ extern SAMPLE scan_max(SAMPLE* block, int len);
 // envelopes
 extern SAMPLE compute_breakpoint_scale(uint16_t osc, uint8_t bp_set, uint16_t sample_offset);
 extern SAMPLE compute_mod_scale(uint16_t osc);
+extern SAMPLE compute_mod1_scale(uint16_t osc);
 extern SAMPLE compute_mod_value(uint16_t mod_osc);
 extern void retrigger_mod_source(uint16_t osc);
 

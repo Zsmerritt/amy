@@ -24,7 +24,7 @@ AMY_IRAM_ATTR SAMPLE compute_mod_value(uint16_t mod_osc) {
     if(synth[mod_osc]->wave == TRIANGLE) value = compute_mod_triangle(mod_osc);
     if(synth[mod_osc]->wave == SINE) value = compute_mod_sine(mod_osc);
     if(pcm_samples)
-        if(synth[mod_osc]->wave == PCM) value = compute_mod_pcm(mod_osc);
+        if(AMY_WAVE_IS_PCM(synth[mod_osc]->wave)) value = compute_mod_pcm(mod_osc);
     if(AMY_HAS_CUSTOM) {
         if(synth[mod_osc]->wave == CUSTOM) value = compute_mod_custom(mod_osc);
     }
@@ -32,8 +32,7 @@ AMY_IRAM_ATTR SAMPLE compute_mod_value(uint16_t mod_osc) {
     return value;
 }
 
-AMY_IRAM_ATTR SAMPLE compute_mod_scale(uint16_t osc) {
-    uint16_t source = synth[osc]->mod_source;
+AMY_IRAM_ATTR static SAMPLE mod_scale_from_source(uint16_t source, uint16_t osc) {
     if(AMY_IS_SET(source)) {
         if(source != osc) {  // that would be weird
             hold_and_modify(source);
@@ -41,6 +40,14 @@ AMY_IRAM_ATTR SAMPLE compute_mod_scale(uint16_t osc) {
         }
     }
     return 0; // 0 is no change, unlike bp scale
+}
+
+AMY_IRAM_ATTR SAMPLE compute_mod_scale(uint16_t osc) {
+    return mod_scale_from_source(synth[osc]->mod_source, osc);
+}
+
+AMY_IRAM_ATTR SAMPLE compute_mod1_scale(uint16_t osc) {
+    return mod_scale_from_source(synth[osc]->mod1_source, osc);
 }
 
 // sample_offset allows you to probe the EG output at some point this many samples into the future.
@@ -127,7 +134,11 @@ AMY_IRAM_ATTR SAMPLE compute_breakpoint_scale(uint16_t osc, uint8_t bp_set, uint
         }
     }
     
-    if(found<0) return scale;
+    if(found<0) {
+        // Not via return_label: that path updates last_scale, which this one must not.
+        AMY_PROFILE_STOP(COMPUTE_BREAKPOINT_SCALE)
+        return scale;
+    }
 
     t1 = bp_end_times[found];
     v1 = F2S(synth[osc]->breakpoint_values[bp_set][found]);

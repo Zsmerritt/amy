@@ -16,6 +16,11 @@ uint16_t next_user_patch_index = 0;
 uint8_t * osc_to_voice = NULL;
 uint16_t *voice_to_base_osc = NULL;
 
+// Number of low-numbered oscs the host drives directly and the patch/voice
+// allocator must never claim.  0 (default) = allocator may use every osc.
+// (from Leeman1982/amy)
+uint16_t amy_reserved_oscs = 0;
+
 void patches_deinit() {
     memory_patch_deltas = NULL;
     memory_patch_oscs = NULL;
@@ -290,6 +295,8 @@ int sprint_event(amy_event *e, char *s, size_t len, bool wirecode) {
     _EPRINT_I(portamento_ms, "portamento_ms", "m");
     _EPRINT_I(chained_osc, "chained_osc", "c");
     _EPRINT_I(mod_source, "mod_source", "L");
+    _EPRINT_I(mod1_source, "mod1_source", "J");
+    _EPRINT_I(sync_source, "sync_source", "Y");
     _EPRINT_I(algorithm, "algorithm", "o");
     _EPRINT_I(filter_type, "filter_type", "G");
     _EPRINT_I_SEQ(bp_is_set, "bp_is_set", MAX_BREAKPOINT_SETS, "??");
@@ -322,6 +329,7 @@ int sprint_event(amy_event *e, char *s, size_t len, bool wirecode) {
     _EPRINT_VALS_5(e->echo_level, e->echo_delay_ms, e->echo_max_delay_ms, e->echo_feedback, e->echo_filter_coef, "echo_{level,delay,max,fb,filt}", "M");
     _EPRINT_VALS_5(e->chorus_level, e->chorus_max_delay, e->chorus_lfo_freq, e->chorus_depth, AMY_UNSET_FLOAT, "chorus_{level,delay,lfo,depth}", "k");
     _EPRINT_VALS_5(e->reverb_level, e->reverb_liveness, e->reverb_damping, e->reverb_xover_hz, AMY_UNSET_FLOAT, "reverb_{level,live,damp,xover}", "h");
+    _EPRINT_F(reverb_send, "reverb_send", "q");
 
     if (wirecode && (s - s_entry) > 0) { snprintf(s, len - (size_t)(s - s_entry), "Z"); s += strlen(s); }
 
@@ -362,7 +370,8 @@ bool event_is_bus_directed(amy_event *e) {
         || AMY_IS_SET(e->eq_l) || AMY_IS_SET(e->eq_m) || AMY_IS_SET(e->eq_h)
         || AMY_IS_SET(e->echo_level) || AMY_IS_SET(e->echo_delay_ms) || AMY_IS_SET(e->echo_max_delay_ms) || AMY_IS_SET(e->echo_feedback) || AMY_IS_SET(e->echo_filter_coef)
         || AMY_IS_SET(e->chorus_level) || AMY_IS_SET(e->chorus_max_delay) || AMY_IS_SET(e->chorus_lfo_freq) || AMY_IS_SET(e->chorus_depth) 
-        || AMY_IS_SET(e->reverb_level) || AMY_IS_SET(e->reverb_liveness) || AMY_IS_SET(e->reverb_damping) || AMY_IS_SET(e->reverb_xover_hz)) {
+        || AMY_IS_SET(e->reverb_level) || AMY_IS_SET(e->reverb_liveness) || AMY_IS_SET(e->reverb_damping) || AMY_IS_SET(e->reverb_xover_hz)
+        || AMY_IS_SET(e->reverb_send)) {
         bus_directed_command = true;
     }
     return bus_directed_command;
@@ -393,6 +402,8 @@ bool event_addresses_oscs(amy_event *e, bool *p_is_empty) {
     _RET_TRUE_IF_SET(portamento_ms);
     _RET_TRUE_IF_SET(chained_osc);
     _RET_TRUE_IF_SET(mod_source);
+    _RET_TRUE_IF_SET(mod1_source);
+    _RET_TRUE_IF_SET(sync_source);
     _RET_TRUE_IF_SET(algorithm);
     _RET_TRUE_IF_SET(filter_type);
     _RET_TRUE_IF_SET_SEQ(bp_is_set, MAX_BREAKPOINT_SETS);
@@ -410,6 +421,7 @@ bool event_addresses_oscs(amy_event *e, bool *p_is_empty) {
     _RET_TRUE_IF_SET(synth_delay_ms);  // Extra delay added to synth note-ons to allow decay on voice-stealing.
     _RET_TRUE_IF_SET(to_synth);  // For moving setup between synth numbers.
     _RET_TRUE_IF_SET(grab_midi_notes);  // To enable/disable automatic MIDI note-on/off generating note-on/off.
+    _RET_TRUE_IF_SET(mpe_members);  // MPE zone configuration.
     _RET_TRUE_IF_SET(note_source_channel);  // Marks synth as MIDI-driven, so note-on events aren't echo'd to output MIDI.
     _RET_TRUE_IF_SET(pedal);  // MIDI pedal value.
     _RET_TRUE_IF_SET(num_voices);
@@ -425,6 +437,7 @@ bool event_addresses_oscs(amy_event *e, bool *p_is_empty) {
     is_empty &= _TRUE_IF_5_F_UNSET(e->eq_l, e->eq_m, e->eq_h, AMY_UNSET_FLOAT, AMY_UNSET_FLOAT);
     is_empty &= _TRUE_IF_5_F_UNSET(e->echo_level, e->echo_delay_ms, e->echo_max_delay_ms, e->echo_feedback, e->echo_filter_coef);
     is_empty &= _TRUE_IF_5_F_UNSET(e->chorus_level, e->chorus_max_delay, e->chorus_lfo_freq, e->chorus_depth, AMY_UNSET_FLOAT);
+    is_empty &= _TRUE_IF_5_F_UNSET(e->reverb_send, AMY_UNSET_FLOAT, AMY_UNSET_FLOAT, AMY_UNSET_FLOAT, AMY_UNSET_FLOAT);
     is_empty &= _TRUE_IF_5_F_UNSET(e->reverb_level, e->reverb_liveness, e->reverb_damping, e->reverb_xover_hz, AMY_UNSET_FLOAT);
 
     // If none of the bus events are set, but the bus flag itself is set, we're trying to set the bus of a (default??) osc
@@ -486,6 +499,8 @@ struct delta *deltas_to_event(struct delta *queue, struct amy_event *event) {
       _CASE_I(chained_osc, CHAINED_OSC)
       _CASE_I(reset_osc, RESET_OSC)
       _CASE_I(mod_source, MOD_SOURCE)
+      _CASE_I(mod1_source, MOD1_SOURCE)
+      _CASE_I(sync_source, SYNC_SOURCE)
       _CASE_I(note_source_channel, NOTE_SOURCE_CHANNEL)
       _CASE_I(filter_type, FILTER_TYPE)
       _CASE_I(algorithm, ALGORITHM)
@@ -505,6 +520,7 @@ struct delta *deltas_to_event(struct delta *queue, struct amy_event *event) {
       _CASE_F(reverb_liveness, REVERB_LIVENESS)
       _CASE_F(reverb_damping, REVERB_DAMPING)
       _CASE_F(reverb_xover_hz, REVERB_XOVER_HZ)
+      _CASE_F(reverb_send, REVERB_SEND)
       _CASE_I(eg_type[0], EG0_TYPE)
       _CASE_I(eg_type[1], EG1_TYPE)
       _CASE_F(velocity, VELOCITY)
@@ -643,6 +659,8 @@ void set_event_for_osc(int base_osc, int rel_osc, struct amy_event *event) {
     EVENT_FROM_OSC_MAPPED(portamento_alpha, portamento_ms, alpha_to_portamento_ms);
     EVENT_FROM_OSC_BASEOSC(chained_osc);
     EVENT_FROM_OSC_BASEOSC(mod_source);
+    EVENT_FROM_OSC_BASEOSC(mod1_source);
+    EVENT_FROM_OSC_BASEOSC(sync_source);
     EVENT_FROM_OSC(algorithm);
     EVENT_FROM_OSC(filter_type);
     EVENT_FROM_OSC_ARRAY_BASEOSC(algo_source, MAX_ALGO_OPS);
@@ -871,6 +889,10 @@ uint8_t patches_voices_for_note_onoff_event(amy_event *e, uint16_t voices[], uin
             // This event includes a note *and* a preset, so it's like a drum sample note on.
             // Wrap the preset number into the note, so we don't allocate the same pitch for different drums to the same voice.
             note += 128 * e->preset;
+        } else if (AMY_IS_SET(e->note_source_channel) && amy_mpe_is_member_channel(e->note_source_channel)) {
+            // MPE allows the same note number to sound on different member channels;
+            // wrap the channel into the note key so each gets its own voice.
+            note += 128 * e->note_source_channel;
         }
         bool is_note_off = (e->velocity == 0);
         voices[0] = instrument_voice_for_note_event(e->synth, note, is_note_off, pstolen);
@@ -923,6 +945,11 @@ uint8_t patches_voices_for_event(amy_event *e, uint16_t voices[]) {
         if (AMY_IS_SET(e->grab_midi_notes)) {
             // Set the grab_midi state.
             instrument_set_grab_midi_notes(e->synth, e->grab_midi_notes);
+        }
+        if (AMY_IS_SET(e->mpe_members)) {
+            // Configure the MPE zone whose master channel is this synth.
+            amy_mpe_config(e->synth, e->mpe_members,
+                           AMY_IS_SET(e->mpe_bend_range) ? e->mpe_bend_range : AMY_UNSET_FLOAT);
         }
         if (AMY_IS_SET(e->pedal)) {
             // Pedal events are a special case
@@ -1012,7 +1039,7 @@ void patches_event_has_voices(amy_event *e, struct delta **queue) {
     // Should we invoke MIDI note-on cmd rules?
     if (synth_flags & SYNTH_FLAGS_NOTES_VIA_MIDI
         && AMY_IS_SET(e->midi_note)
-        && (e->note_source_channel != synth)) {
+        && (amy_mpe_synth_for_channel(e->note_source_channel) != synth)) {
         // Route note-on event via MIDI to invoke midi_note_cmds
         uint8_t bytes[3];
         bytes[0] = 0x90 + (0x0F & (instrument - 1));
@@ -1225,21 +1252,28 @@ void patches_load_patch(amy_event *e) {
         // Find the first osc with oscs_per_voice free oscs.
         uint8_t good = 0;
 
-        uint16_t osc_start = (AMY_OSCS/2);
+        // Hosts that drive low-numbered oscs directly (outside the voice
+        // allocator's knowledge) set amy_reserved_oscs; the scan never
+        // touches oscs below that floor.
+        uint16_t reserved = amy_reserved_oscs;
+        if (reserved >= AMY_OSCS) reserved = 0;
+        uint16_t span = AMY_OSCS - reserved;
+
+        uint16_t osc_start = reserved + (span/2);
 
         #ifdef TULIP
         // On tulip. core 0 (oscs0-60) is shared with the display, who does GDMA a lot. so we favor core1 (oscs60-120)
-        if(voices[v]%3==2) osc_start = 0;
+        if(voices[v]%3==2) osc_start = reserved;
         #else
-        if(voices[v]%2==1) osc_start = 0;
+        if(voices[v]%2==1) osc_start = reserved;
         #endif
 
-        for(uint16_t i=0;i<AMY_OSCS;i++) {
-            uint16_t osc = (osc_start + i) % AMY_OSCS;
+        for(uint16_t i=0;i<span;i++) {
+            uint16_t osc = reserved + (uint16_t)((osc_start - reserved + i) % span);
             if(AMY_IS_UNSET(osc_to_voice[osc])) {
                 // Are there num_voices x oscs_per_voice free oscs after this one?
-                good = 1;
-                for(uint16_t j=0; j < oscs_per_voice; j++) {
+                good = (osc + oscs_per_voice <= AMY_OSCS);
+                for(uint16_t j=0; good && j < oscs_per_voice; j++) {
                     good = good & (AMY_IS_UNSET(osc_to_voice[osc + j]));
                 }
                 if(good) {

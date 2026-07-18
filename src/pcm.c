@@ -36,18 +36,95 @@ typedef struct memorypcm_ll_t{
     uint16_t preset_number;
 } memorypcm_ll_t;
 
+// FLASH FENCE: on platforms that serve PCM banks straight from memory-mapped
+// flash (ESP32-S3 partitions), a flash program/erase suspends the cache those
+// reads go through while the render task keeps running (code and rodata live
+// in PSRAM on a separate bus) -- one sample fetch during the write window
+// hard-crashes the chip (dual-core interrupt WDT). The platform sets
+// [lo, hi) to its flash-mapped address window and raises amy_flash_fence
+// around every filesystem write; fenced renders skip the fetch and emit
+// silence for those oscs (phase held, so the voice resumes afterwards).
+// Everything not in the window -- computed voices, PSRAM-loaded banks --
+// renders on undisturbed.
+volatile uint8_t amy_flash_fence = 0;
+const void *amy_flash_fence_lo = 0;
+const void *amy_flash_fence_hi = 0;
+
 
 memorypcm_ll_t * memorypcm_ll_start;
 
 #define PCM_AMY_LOG2_SAMPLE_RATE log2f(PCM_AMY_SAMPLE_RATE / ZERO_LOGFREQ_IN_HZ)
 
+// Compile-time size check that works on any C/C++ standard (negative array
+// size on failure) -- keeps amy.h's published blob sizes in lockstep with
+// the baked map headers without pulling those headers into platform code.
+#define AMY_PCM_SIZE_CHECK(name, cond) typedef char name[(cond) ? 1 : -1]
+
 #ifdef GAMMA9001
 #include "pcm_gamma9001.h"
+AMY_PCM_SIZE_CHECK(amy_gamma9001_bytes_check,
+                   AMY_GAMMA9001_PCM_BYTES == 2u * GAMMA9001_BIN_FRAMES);
 // Set by the platform at boot: web links the drums.bin blob in and passes it,
 // ESP32-S3 passes the esp_partition_mmap'd partition. NULL = banks unavailable.
 const int16_t * gamma9001_pcm = NULL;
 void amy_set_gamma9001_pcm(const int16_t * data) {
     gamma9001_pcm = data;
+}
+#endif
+
+#ifdef GM_FONTS
+#include "pcm_gm.h"
+#include "pcm_gm_big.h"
+AMY_PCM_SIZE_CHECK(amy_gm_bytes_check, AMY_GM_PCM_BYTES == 2u * GM_BIN_FRAMES);
+AMY_PCM_SIZE_CHECK(amy_gm_big_bytes_check,
+                   AMY_GM_BIG_PCM_BYTES == 2u * GM_BIG_BIN_FRAMES);
+AMY_PCM_SIZE_CHECK(amy_gm_big_emu4_window_check,
+                   AMY_GM_BIG_EMU4_FIRST_SAMPLE < AMY_GM_BIG_EMU4_END_SAMPLE &&
+                   AMY_GM_BIG_EMU4_END_SAMPLE <= GM_BIG_BIN_FRAMES);
+// amy_set_gm_big_pcm_window's map sanity check reads the entries for presets
+// 1903 and 2060 (the emu4 window edges) -- keep them inside the map.
+AMY_PCM_SIZE_CHECK(amy_gm_big_emu4_edges_check,
+                   1903 >= GM_BIG_PRESET_BASE &&
+                   2060 < GM_BIG_PRESET_BASE + GM_BIG_NUM_SAMPLES);
+// Set by the platform at boot from separate esp_partition_mmap ranges of
+// the `fonts` partition (one 12.5MB map didn't fit the S3's remaining
+// contiguous data vaddr): gm_pcm = GeneralUser bank (partition offset 0),
+// gm_big_pcm = big multi-font bank (0x4B0000). NULL = that bank unavailable.
+const int16_t * gm_pcm = NULL;
+void amy_set_gm_pcm(const int16_t * data) {
+    gm_pcm = data;
+}
+// The big bank may be only partially resident: gm_big_pcm points at blob
+// sample gm_big_first_sample, and gm_big_num_samples samples follow it.
+// Presets outside that window return NULL (silent) from
+// get_preset_for_preset_number -- their samples have no valid address.
+// Default = whole blob (web/hosted builds that link or map all of it).
+const int16_t * gm_big_pcm = NULL;
+static uint32_t gm_big_first_sample = 0;
+static uint32_t gm_big_num_samples = GM_BIG_BIN_FRAMES;
+void amy_set_gm_big_pcm(const int16_t * data) {
+    gm_big_pcm = data;
+    gm_big_first_sample = 0;
+    gm_big_num_samples = GM_BIG_BIN_FRAMES;
+}
+void amy_set_gm_big_pcm_window(const int16_t * data,
+                               uint32_t first_sample, uint32_t num_samples) {
+    // Refuse a stale window: if the published emu4 constants (amy.h) no
+    // longer match the baked map -- e.g. the bank was rebaked and the
+    // constants weren't updated -- the platform just mapped the WRONG byte
+    // range, and translating preset offsets through it would play garbage
+    // (or walk off the map). Silent-but-logged beats garbage-or-crash.
+    if (first_sample == AMY_GM_BIG_EMU4_FIRST_SAMPLE &&
+        (gm_big_map[1903 - GM_BIG_PRESET_BASE].offset != AMY_GM_BIG_EMU4_FIRST_SAMPLE ||
+         gm_big_map[2060 - GM_BIG_PRESET_BASE].offset +
+         gm_big_map[2060 - GM_BIG_PRESET_BASE].length != AMY_GM_BIG_EMU4_END_SAMPLE)) {
+        fprintf(stderr, "gm_big: emu4 window constants out of sync with gm_big_map; big bank disabled\n");
+        gm_big_pcm = NULL;
+        return;
+    }
+    gm_big_pcm = data;
+    gm_big_first_sample = first_sample;
+    gm_big_num_samples = num_samples;
 }
 #endif
 
@@ -82,6 +159,55 @@ memorypcm_preset_t * get_preset_for_preset_number(uint16_t preset_number,
         rom_local->midinote = g->midinote;
         rom_local->samplerate = GAMMA9001_SAMPLE_RATE;
         rom_local->log2sr = log2f((float)GAMMA9001_SAMPLE_RATE / ZERO_LOGFREQ_IN_HZ);
+        rom_local->type = AMY_PCM_TYPE_GAMMA;
+        rom_local->channels = 1;
+        return rom_local;
+    }
+#endif
+
+#ifdef GM_FONTS
+    // GM SoundFont presets live at GM_PRESET_BASE+, read straight out of the
+    // mmapped fonts partition (memory presets above may still shadow them).
+    if (preset_number >= GM_PRESET_BASE &&
+        preset_number < GM_PRESET_BASE + GM_NUM_SAMPLES &&
+        gm_pcm != NULL && rom_local != NULL) {
+        const pcm_map_t *g = &gm_map[preset_number - GM_PRESET_BASE];
+        memset(rom_local, 0, sizeof(*rom_local));
+        rom_local->sample_ram = (int16_t *)gm_pcm + g->offset;
+        rom_local->length = g->length;
+        rom_local->loopstart = g->loopstart;
+        rom_local->loopend = g->loopend;
+        rom_local->midinote = g->midinote;
+        rom_local->samplerate = GM_SAMPLE_RATE;
+        rom_local->log2sr = log2f((float)GM_SAMPLE_RATE / ZERO_LOGFREQ_IN_HZ);
+        rom_local->type = AMY_PCM_TYPE_GAMMA;
+        rom_local->channels = 1;
+        return rom_local;
+    }
+
+    // Big multi-font bank presets live at GM_BIG_PRESET_BASE+, own mmap.
+    if (preset_number >= GM_BIG_PRESET_BASE &&
+        preset_number < GM_BIG_PRESET_BASE + GM_BIG_NUM_SAMPLES &&
+        gm_big_pcm != NULL && rom_local != NULL) {
+        const pcm_map_t *g = &gm_big_map[preset_number - GM_BIG_PRESET_BASE];
+        // Range guard: only a window of the blob may be resident (the
+        // ESP32-S3 maps just the emu4 slice). A preset outside the window
+        // has no valid address -- return NULL (silent) rather than
+        // dereferencing unmapped vaddr (reachable from a raw wire message
+        // naming any big-bank preset number).
+        if (g->offset < gm_big_first_sample)
+            return NULL;
+        uint32_t rel = g->offset - gm_big_first_sample;
+        if (rel >= gm_big_num_samples || g->length > gm_big_num_samples - rel)
+            return NULL;
+        memset(rom_local, 0, sizeof(*rom_local));
+        rom_local->sample_ram = (int16_t *)gm_big_pcm + rel;
+        rom_local->length = g->length;
+        rom_local->loopstart = g->loopstart;
+        rom_local->loopend = g->loopend;
+        rom_local->midinote = g->midinote;
+        rom_local->samplerate = GM_BIG_SAMPLE_RATE;
+        rom_local->log2sr = log2f((float)GM_BIG_SAMPLE_RATE / ZERO_LOGFREQ_IN_HZ);
         rom_local->type = AMY_PCM_TYPE_GAMMA;
         rom_local->channels = 1;
         return rom_local;
@@ -165,6 +291,12 @@ void pcm_note_on(uint16_t osc) {
         memorypcm_preset_t rom_local;
         memorypcm_preset_t *preset =
             get_preset_for_preset_number(synth[osc]->preset, &rom_local);
+        if (preset == NULL) {
+            // Unresolvable preset (e.g. big-bank preset outside the mapped
+            // emu4 window): stay silent, don't dereference.
+            synth[osc]->status = SYNTH_OFF;
+            return;
+        }
         if (preset->type == AMY_PCM_TYPE_FILE) {
             if (preset->file_handle != 0) {
                 wave_info_t info = {0};
@@ -176,7 +308,14 @@ void pcm_note_on(uint16_t osc) {
                     preset->log2sr = log2f((float)info.sample_rate / ZERO_LOGFREQ_IN_HZ);
                     preset->file_bytes_remaining = data_bytes;
                 } else {
+                    // Re-parse failed (review C7): close AND clear the handle,
+                    // then force the voice off. The old code left file_handle
+                    // non-zero on a now-closed handle, so the next render_pcm
+                    // issued fseek/read on it. Zeroing file_handle + marking the
+                    // voice off mirrors render_pcm's own sample_ram==NULL bail.
                     amy_global.config.amy_external_fclose_hook(preset->file_handle);
+                    preset->file_handle = 0;
+                    synth[osc]->status = SYNTH_OFF;
                 }
             }
         } else if (preset->type == AMY_PCM_TYPE_ROM) {
@@ -184,6 +323,14 @@ void pcm_note_on(uint16_t osc) {
             if(synth[osc]->preset >= pcm_samples) synth[osc]->preset = 0;
         }
         
+        // Declick: if this osc was still emitting audio (voice reuse/steal),
+        // fold its last output into a decaying offset so the phase reset below
+        // doesn't produce a step. Fresh/silent voices have pcm_last_out == 0.
+        // (+=: a retrigger arriving before an earlier declick has drained
+        // accumulates rather than dropping the earlier offset.)
+        synth[osc]->pcm_declick += synth[osc]->pcm_last_out;
+        synth[osc]->pcm_last_out = 0;
+
         if (AMY_IS_SET(synth[osc]->trigger_phase)) {
             // trigger_phase (P) sets the sample start point for this
             // note-on (start_frame / 2^PCM_INDEX_BITS).
@@ -206,6 +353,15 @@ void pcm_mod_trigger(uint16_t osc) {
 
 void pcm_note_off(uint16_t osc) {
     if(AMY_IS_SET(synth[osc]->preset)) {
+        // feedback >= 2: "sustain through release" (from Leeman1982/amy) -- the
+        // host has an amp envelope with a meaningful release stage, so don't
+        // stop the sample here: looped presets keep looping, one-shots keep
+        // playing to their natural end, and the EG fades the voice (the osc
+        // stops when the envelope completes). Without this, the release stage
+        // had at most the sample's loop tail (~tens of ms) to act on.
+        if(msynth[osc]->feedback >= 2) {
+            return;
+        }
         uint32_t length = 0;
         memorypcm_preset_t rom_local;
         memorypcm_preset_t *preset =
@@ -250,6 +406,12 @@ SAMPLE render_pcm(SAMPLE* buf, uint16_t osc) {
         memorypcm_preset_t rom_local;
         memorypcm_preset_t *preset =
             get_preset_for_preset_number(synth[osc]->preset, &rom_local);
+        if (preset == NULL) {
+            // Unresolvable preset (e.g. big-bank preset outside the mapped
+            // emu4 window): render silence and shut the voice off.
+            synth[osc]->status = SYNTH_OFF;
+            return 0;
+        }
         float logfreq = msynth[osc]->logfreq;
         // If osc[midi_note] is set, shift the freq by the preset's default base_note.
         if (AMY_IS_SET(synth[osc]->midi_note)) {
@@ -275,21 +437,54 @@ SAMPLE render_pcm(SAMPLE* buf, uint16_t osc) {
             synth[osc]->status = SYNTH_OFF;
             return 0;
         }
+        if (amy_flash_fence
+            && (const void *)preset->sample_ram >= amy_flash_fence_lo
+            && (const void *)preset->sample_ram < amy_flash_fence_hi) {
+            // A flash write is in progress and this sample lives in mapped
+            // flash: fetching it now would fault (cache suspended). Emit
+            // silence, hold the phase; the voice resumes when the fence drops.
+            return 0;
+        }
 
         SAMPLE amp = F2S(msynth[osc]->amp);
         PHASOR step = F2P((playback_freq / (float)AMY_SAMPLE_RATE) / (float)(1 << PCM_INDEX_BITS));
         const LUTSAMPLE* table = preset->sample_ram;
-        uint32_t base_index = INT_OF_P(synth[osc]->phase, PCM_INDEX_BITS);
+        // Hoist the phase into a LOCAL for the block: synth[osc]->phase is a
+        // PSRAM pointer-chase that this loop used to read AND write EVERY
+        // sample -- the only renderer that didn't hoist (firmware review
+        // C-5, ~1-4% of a core under drum kits). Written back once below.
+        PHASOR phase = synth[osc]->phase;
+        // Declick offset decays by 1/16 per sample (tau ~16 samples ~0.4ms); snap
+        // to zero below ~2 LSB-of-16-bit so fixed-point decay can't stall nonzero.
+        #define PCM_DECLICK_EPS F2S(0.000002f)
+        SAMPLE last_out = synth[osc]->pcm_last_out;
+        SAMPLE declick = synth[osc]->pcm_declick;
+        uint8_t status_off = 0;
+        uint32_t base_index = INT_OF_P(phase, PCM_INDEX_BITS);
         for(uint16_t i=0; i < AMY_BLOCK_SIZE; i++) {
-            SAMPLE frac = S_FRAC_OF_P(synth[osc]->phase, PCM_INDEX_BITS);
+            SAMPLE frac = S_FRAC_OF_P(phase, PCM_INDEX_BITS);
             LUTSAMPLE b = 0;
             LUTSAMPLE c = 0;
             uint32_t next_index = base_index + 1;
             if (base_index >= sample_length) {
                 if (preset->type != AMY_PCM_TYPE_FILE) {
-                    synth[osc]->status = SYNTH_OFF;
+                    status_off = 1;
                 }
-                buf[i] = 0;
+                if (last_out != 0) { declick += last_out; last_out = 0; }
+                SAMPLE dz = 0;
+                if (declick != 0) {
+                    dz = declick;
+                    declick -= SHIFTR(declick, 4);
+                    if (declick < PCM_DECLICK_EPS && declick > -PCM_DECLICK_EPS) declick = 0;
+                }
+                buf[i] = dz;
+                // Count the emitted tail in the returned peak: the silent-voice
+                // reaper (render_osc_wave) gates on max_val < AMP_THRESH, and
+                // EG-released feedback>=2 PCM voices now set terminate_on_silence
+                // -- an audible tail must keep the voice unreapable until it has
+                // drained, whatever the decay constant or block size.
+                if (dz < 0) dz = -dz;
+                if (dz > max_value) max_value = dz;
                 continue;
             }
             if (preset->channels == 2) {
@@ -302,13 +497,18 @@ SAMPLE render_pcm(SAMPLE* buf, uint16_t osc) {
                     b = table[base_offset + 1];
                     c = (next_index < sample_length) ? table[next_offset + 1] : b;
                 } else { // PCM or PCM_MIX
+                    // >> 1 instead of / 2 (review C4): signed int32 operands, so
+                    // the shift floors toward -inf where / 2 truncated toward 0
+                    // -- a 1-LSB rounding-direction change on negative sums,
+                    // acceptable per the review, and it drops the per-sample
+                    // integer divide on the drum-kit hot path.
                     LUTSAMPLE bl = table[base_offset];
                     LUTSAMPLE br = table[base_offset + 1];
-                    b = (LUTSAMPLE)(((int32_t)bl + (int32_t)br) / 2);
+                    b = (LUTSAMPLE)(((int32_t)bl + (int32_t)br) >> 1);
                     if (next_index < sample_length) {
                         LUTSAMPLE cl = table[next_offset];
                         LUTSAMPLE cr = table[next_offset + 1];
-                        c = (LUTSAMPLE)(((int32_t)cl + (int32_t)cr) / 2);
+                        c = (LUTSAMPLE)(((int32_t)cl + (int32_t)cr) >> 1);
                     } else {
                         c = b;
                     }
@@ -318,33 +518,54 @@ SAMPLE render_pcm(SAMPLE* buf, uint16_t osc) {
                 c = (next_index < sample_length) ? table[next_index] : b;
             }
             SAMPLE sample = L2S(b) + MUL4_SS(L2S(c - b), frac);
-            synth[osc]->phase = P_WRAPPED_SUM(synth[osc]->phase, step);
-            base_index = INT_OF_P(synth[osc]->phase, PCM_INDEX_BITS);
+            phase = P_WRAPPED_SUM(phase, step);
+            base_index = INT_OF_P(phase, PCM_INDEX_BITS);
 
             if(preset->type != AMY_PCM_TYPE_FILE) {
                 // For non-file samples, we have to check for end of sample/looping.
                 if(base_index >= sample_length) { // end
-                    synth[osc]->status = SYNTH_OFF;// is this right?
+                    status_off = 1;
                     sample = 0;
+                    if (last_out != 0) { declick += last_out; last_out = 0; }
                 } else {
                     if(msynth[osc]->feedback > 0) { // still looping.  The feedback flag is cleared by pcm_note_off.
                         if(base_index >= preset->loopend) { // loopend
-                            // back to loopstart
+                            // back to loopstart -- but only for a real sustain
+                            // loop. One-shot presets have loopend == length;
+                            // wrapping those would machine-gun the whole sample
+                            // (reachable via feedback >= 2 sustain-through-
+                            // release on a one-shot).
                             int32_t loop_len = preset->loopend - preset->loopstart;
-                            synth[osc]->phase -= F2P(loop_len / (float)(1 << PCM_INDEX_BITS));
-                            base_index -= loop_len;
+                            if(loop_len > 0 && (uint32_t)loop_len < preset->length) {
+                                phase -= F2P(loop_len / (float)(1 << PCM_INDEX_BITS));
+                                base_index -= loop_len;
+                            }
                         }
                     }
                 }
             }
-            SAMPLE value = buf[i] + MUL4_SS(amp, sample);
-            buf[i] = value;   
+            SAMPLE out = MUL4_SS(amp, sample);
+            last_out = out;              // this osc's own contribution, excluding declick
+            if (declick != 0) {
+                out += declick;
+                declick -= SHIFTR(declick, 4);
+                if (declick < PCM_DECLICK_EPS && declick > -PCM_DECLICK_EPS) declick = 0;
+            }
+            SAMPLE value = buf[i] + out;
+            buf[i] = value;
             if (value < 0) value = -value;
-            if (value > max_value) max_value = value;  
+            if (value > max_value) max_value = value;
         }
+        synth[osc]->phase = phase;         // hoisted local written back once
+        synth[osc]->pcm_last_out = last_out;
+        synth[osc]->pcm_declick = declick;
+        // Defer the off until the declick tail has fully drained (<= ~2 blocks):
+        // next block renders the past-end path above, which emits only the
+        // decaying offset and re-raises status_off until declick snaps to 0.
+        if (status_off && declick == 0) synth[osc]->status = SYNTH_OFF;
         //printf("render_pcm: osc %d preset %d len %d base_ix %d phase %f step %f tablestep %f amp %f\n",
         //       osc, synth[osc]->preset, preset->length, base_index, P2F(synth[osc]->phase), P2F(step), (1 << PCM_INDEX_BITS) * P2F(step), S2F(msynth[osc]->amp));
-        return max_value; 
+        return max_value;
         // i don't believe we ever need to detect silence in a sample. it will shut itself off at the end.
     }
     return 0;
@@ -412,6 +633,8 @@ int pcm_load_file() {
     memory_preset->log2sr = log2f((float)info.sample_rate / ZERO_LOGFREQ_IN_HZ);
     memory_preset->midinote = midinote;
     memory_preset->length = total_frames;
+    memory_preset->loopstart = 0;
+    memory_preset->loopend = 0;
     memory_preset->type = AMY_PCM_TYPE_FILE;
     memory_preset->file_bytes_remaining = total_frames * info.channels * 2;
     memory_preset->file_handle = handle;
@@ -452,10 +675,16 @@ int16_t * pcm_load(uint16_t preset_number, uint32_t length, uint32_t samplerate,
     memory_preset->type = AMY_PCM_TYPE_MEMORY;
     memory_preset->sample_ram = (int16_t *)(((uint8_t *)memory_preset) + sizeof(memorypcm_preset_t));
     if(loopend == 0) {  // loop whole sample
-        memory_preset->loopend = memory_preset->length-1;
+        memory_preset->loopend = (length > 0) ? memory_preset->length-1 : 0;
     } else {
         memory_preset->loopend = loopend;
     }
+    // Clamp the loop window (review FW-13): loopstart >= loopend or
+    // loopend > length produced undefined phase math in pcm_note_off.
+    if (memory_preset->loopend >= length && length > 0)
+        memory_preset->loopend = length - 1;
+    if (memory_preset->loopstart >= memory_preset->loopend)
+        memory_preset->loopstart = 0;
     new_preset_pointer->preset = memory_preset;
     return memory_preset->sample_ram;
 }

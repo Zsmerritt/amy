@@ -497,18 +497,30 @@ void filters_deinit(uint8_t bus) {
 
 
 void filters_init(uint8_t bus) {
+    // FW-12: this EQ allocation chain was entirely unchecked. There is no
+    // clean per-bus EQ disable flag -- parametric_eq_process() dereferences
+    // eq_coeffs/eq_delay unconditionally once any eq band != 1.0 -- so a
+    // partial (NULL) allocation left in place would be a use-of-NULL crash at
+    // render time. An init-time OOM means the synth could never have run at
+    // all (unlike the runtime delta pool, which degrades), so per the review
+    // the minimal safe behavior is a single bail-out that prints one line and
+    // abort()s here. (abort() ends the process, so freeing the partial
+    // allocations is moot and deliberately omitted.)
     SAMPLE ***p_eq_coeffs = &amy_global.bus[bus]->eq.eq_coeffs;
     SAMPLE ****p_eq_delay = &amy_global.bus[bus]->eq.eq_delay;
     *p_eq_coeffs = malloc_caps(sizeof(SAMPLE*)*3, amy_global.config.ram_caps_fbl);
     *p_eq_delay = malloc_caps(sizeof(SAMPLE**)*AMY_NCHANS, amy_global.config.ram_caps_fbl);
+    if (*p_eq_coeffs == NULL || *p_eq_delay == NULL) goto eq_oom;
     for(uint16_t i=0;i<3;i++) {
         (*p_eq_coeffs)[i] = malloc_caps(sizeof(SAMPLE) * 5, amy_global.config.ram_caps_fbl);
+        if ((*p_eq_coeffs)[i] == NULL) goto eq_oom;
     }
     for(uint16_t i=0;i<AMY_NCHANS;i++) {
         (*p_eq_delay)[i] = malloc_caps(sizeof(SAMPLE*) * 3, amy_global.config.ram_caps_fbl);
+        if ((*p_eq_delay)[i] == NULL) goto eq_oom;
         for(uint16_t j=0;j<3;j++) {
             (*p_eq_delay)[i][j] = malloc_caps(sizeof(SAMPLE) * FILT_NUM_DELAYS, amy_global.config.ram_caps_fbl);
-
+            if ((*p_eq_delay)[i][j] == NULL) goto eq_oom;
         }
     }
 
@@ -523,6 +535,11 @@ void filters_init(uint8_t bus) {
             }
         }
     }
+    return;
+
+eq_oom:  // FW-12: single bail-out path -- see note at top of filters_init.
+    fprintf(stderr, "filters_init: EQ allocation failed for bus %d at init; aborting\n", bus);
+    abort();
 }
 
 
