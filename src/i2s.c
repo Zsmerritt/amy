@@ -350,6 +350,47 @@ static bool amy_split_inited = false;    // distinct from a legitimately-clamped
 #define AMY_SPLIT_GAIN_SHIFT 14       // step = err >> 14  (~1 osc per 16384 cyc)
 #define AMY_SPLIT_MAX_STEP   8        // clamp osc-index move per block
 
+// Snap a proposed split index to a VOICE boundary so neither core is handed a
+// partial voice.  A voice is a chain: a silent head osc renders the chain sum
+// then applies its envelope + filter (amy.c), while the chain-tail oscs are
+// SYNTH_AUDIBLE at constant amp 1.0 (no EG, no velocity coef).  If the split s
+// lands strictly inside a voice, the FW-6 atomic render_clock claim lets the
+// two cores render the head and the tail separately: the tail oscs then render
+// RAW -- full-scale, un-enveloped, un-filtered -- into the mix while the head's
+// filtered sum loses them.  That is the velocity-invariant, block-gated
+// full-scale buzz on soft notes ("wavefolder at 11").  Aligning s to a voice
+// boundary keeps every chain whole on ONE core.
+//
+// Voices occupy CONTIGUOUS osc blocks carrying a single voice id (patches.c
+// allocates a run and stamps osc_to_voice[osc..osc+n) = voice); osc_to_voice is
+// AMY_UNSET in the gaps between voices.  Snap DOWN to the base of the voice
+// containing s; if that voice starts at osc 0 (snapping down would empty core
+// 0), snap UP to its end instead so both halves stay meaningful -- only a
+// single voice spanning the whole osc range collapses to one core, which is
+// unavoidable (you cannot split one chain without tearing it).
+//
+// osc_to_voice cannot change between this snap and the render pass: it is only
+// mutated by amy_execute_deltas(), which the fill task runs at the TOP of the
+// block loop BEFORE esp_render_on_cores() -> amy_update_split(); core 0 is
+// parked until the notify below.  So the map this reads is exactly the one both
+// cores render against this block.
+static uint16_t amy_split_snap(uint16_t s) {
+    if (osc_to_voice == NULL) return s;             // no voice map: nothing to align
+    if (s == 0 || s >= AMY_OSCS) return s;          // already at an edge boundary
+    if (AMY_IS_UNSET(osc_to_voice[s])) return s;    // s is in a gap: aligned
+    if (osc_to_voice[s] != osc_to_voice[s - 1]) return s;  // s is a voice base: aligned
+    // s is strictly inside a voice.  Find that voice's base osc.
+    uint8_t v = osc_to_voice[s];
+    uint16_t base = s;
+    while (base > 0 && osc_to_voice[base - 1] == v) base--;
+    if (base > 0) return base;                      // snap down: tear-free, both cores fed
+    // Voice starts at osc 0: snapping down would empty core 0.  Snap UP to the
+    // voice's end (== AMY_OSCS only for a single all-spanning voice).
+    uint16_t end = s;
+    while (end < AMY_OSCS && osc_to_voice[end] == v) end++;
+    return end;
+}
+
 // Compute and publish the next block's split index from the last block's
 // per-core render times.  Runs on the fill task (core 1) only, and only while
 // core 0 is parked between blocks, so it is the sole writer of amy_split_index.
@@ -371,7 +412,12 @@ static void amy_update_split(void) {
     int32_t s = (int32_t)amy_split_index - step;         // err>0 -> s decreases
     if (s < 0) s = 0;
     if (s > (int32_t)n) s = (int32_t)n;
-    amy_split_index = (uint16_t)s;                       // publish (single writer)
+    // Align to a voice boundary before publishing so a chain is never split
+    // across cores (see amy_split_snap): the balancing controller still drives
+    // s from the render-time error, but the published boundary is quantized to
+    // whole voices.  The move may exceed MAX_STEP by up to one voice's width;
+    // the deadband keeps that from limit-cycling.
+    amy_split_index = amy_split_snap((uint16_t)s);       // publish (single writer)
 }
 // ---------------------------------------------------------------------------
 
