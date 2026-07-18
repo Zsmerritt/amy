@@ -204,6 +204,26 @@ extern void amy_set_gamma9001_pcm(const int16_t * data);
 #define EQ_CENTER_MED 2500.0
 #define EQ_CENTER_HIGH 7000.0
 
+// How many blocks to keep running a bus's EQ after the bus stops sounding,
+// before skipping the EQ (state frozen) until oscs return. The EQ poles are
+// fixed by the three EQ_CENTER filters (the band gains only scale each
+// stage's zeros/forward gain, so user EQ settings cannot slow the decay);
+// the slowest is the 800 Hz Q=0.707 low band, pole radius ~0.92 => the
+// zero-input tail loses >180 dB per 256-sample block. Measured on the host
+// render harness, one silent block collapses the state to a period-1 fixed
+// point of the truncated biquad iteration (|entries| <= 3 counts ~ -153
+// dBFS) that further zero blocks reproduce exactly -- so freezing it there
+// and skipping is bit-identical to running. 8 blocks (~46 ms at 44.1k) is
+// an 8x margin on the measured settling time.
+#define AMY_EQ_TAIL_BLOCKS 8
+
+// Runtime A/B switch for the silent-bus EQ skip above. 1 (default): skip
+// enabled -- a silent bus's EQ stops after AMY_EQ_TAIL_BLOCKS, state frozen.
+// 0: skip disabled -- non-unity EQ keeps running over zero blocks forever,
+// exactly the pre-skip behavior. Safe to flip at any time from another task
+// (single byte, sampled once per bus per block by amy_fill_buffer).
+extern volatile uint8_t amy_eq_silent_skip;
+
 // reverb setup
 #define REVERB_DEFAULT_LEVEL 0
 #define REVERB_DEFAULT_LIVENESS 0.85f
@@ -804,6 +824,12 @@ typedef struct eq_state {
     SAMPLE eq[3];
     SAMPLE ** eq_coeffs;
     SAMPLE *** eq_delay;
+    // Silence countdown: re-armed to AMY_EQ_TAIL_BLOCKS every block the bus
+    // has audible oscs; decremented on keep-alive (osc-silent) blocks. When
+    // it hits 0 the EQ is skipped (biquad state frozen at its zero-input
+    // fixed point) until the bus sounds again. Written only by
+    // amy_fill_buffer (fill task).
+    uint8_t tail_blocks;
 } eq_state_t;
 
 typedef struct reverb_params {

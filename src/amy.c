@@ -170,6 +170,15 @@ SAMPLE *fbl[AMY_MAX_CORES][AMY_NUM_BUSES];
 SAMPLE *per_osc_fb[AMY_MAX_CORES][AMY_NUM_BUSES];
 SAMPLE core_max[AMY_MAX_CORES];
 
+// Runtime A/B switch for the EQ silent-bus skip (see AMY_EQ_TAIL_BLOCKS in
+// amy.h). 1 (default): a silent bus's EQ stops running once its tail
+// countdown expires (state frozen at the zero-input fixed point). 0: the
+// pre-skip behavior -- a bus with non-unity EQ keeps running its EQ over
+// zero blocks forever, exactly as before the skip existed. Written from the
+// control task (REPL), read by the fill task; single-byte flag sampled once
+// per bus per block, so no atomics needed and either value is always sane.
+volatile uint8_t amy_eq_silent_skip = 1;
+
 // Public pointer to recently-emitted waveform block.
 output_sample_type * amy_out_block = NULL;
 // Audio input blocks. Filled by the audio implementation before rendering.
@@ -2000,8 +2009,43 @@ int16_t * amy_fill_buffer() {
     //if (max_val > 0) {      // NO - see #629
         // apply the eq filters if there is some signal and EQ is non-default.
     for (int bus=0; bus <= amy_global.highest_bus; ++bus) {
-        // Per-bus EQ
-        if (amy_global.bus[bus]->eq.eq[0] != F2S(1.0f) || amy_global.bus[bus]->eq.eq[1] != F2S(1.0f) || amy_global.bus[bus]->eq.eq[2] != F2S(1.0f)) {
+        // Per-bus EQ, with a silent-bus skip (see AMY_EQ_TAIL_BLOCKS).
+        eq_state_t *beq = &amy_global.bus[bus]->eq;
+        uint8_t eq_on = (beq->eq[0] != F2S(1.0f) || beq->eq[1] != F2S(1.0f) || beq->eq[2] != F2S(1.0f));
+        uint8_t run_eq = 0;
+        if (eq_on) {
+            // Did any osc sound on this bus this block? amy_render() zeroes
+            // every bus's fbl at block start and mixes only audible oscs into
+            // it, so an all-zero block here means the bus was silent (its EQ
+            // biquad may still carry an audible tail).
+            uint8_t bus_live = 0;
+            for (int16_t i = 0; i < AMY_BLOCK_SIZE * AMY_NCHANS; ++i) {
+                if (fbl[0][bus][i] != 0) { bus_live = 1; break; }
+            }
+            if (bus_live) {
+                // Oscs sounded: run the EQ and re-arm its silence countdown.
+                run_eq = 1;
+                beq->tail_blocks = AMY_EQ_TAIL_BLOCKS;
+            } else {
+                // Silent block: keep running the EQ while the countdown drains
+                // (tail continuity, no click); when it expires, freeze the
+                // biquad state at its zero-input fixed point and skip the EQ
+                // until oscs return. Freezing rather than clearing makes
+                // skipped blocks bit-identical to running blocks, including
+                // the state the next note starts from, and it stops burning a
+                // full 3-band pass filtering zeros into zeros forever.
+                // amy_eq_silent_skip == 0 disables the skip at runtime: the EQ
+                // then runs on every silent block (countdown ignored), i.e. the
+                // pre-skip behavior of filtering zero blocks forever.
+                uint8_t eq_tail = beq->tail_blocks > 0 || !amy_eq_silent_skip;
+                if (eq_tail) {
+                    run_eq = 1;
+                    // (guarded: with the skip disabled eq_tail is true at 0)
+                    if (beq->tail_blocks > 0) beq->tail_blocks--;
+                }
+            }
+        }
+        if (run_eq) {
             parametric_eq_process(bus, fbl[0][bus]);
         }
         if(AMY_HAS_CHORUS) {
