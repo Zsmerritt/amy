@@ -350,7 +350,7 @@ void *yield_midi_message_handler_events(uint8_t * bytes, uint16_t len, uint32_t 
                     sprintf(message + offset, "t%" PRId32, time);
                     offset = strlen(message);
                 }
-                substitute_midi_special_values(message + offset, mapping->message_template, channel, code, value);
+                substitute_midi_special_values(message + offset, mapping->message_template, synth_channel, code, value);
             }  // If state is non-null, assume we're working through the later yields.
             // Layer each parsed event on top of the caller's base event, if any.
             yield_state->pos = yield_event_from_message(yield_state->message, event, yield_state->pos);
