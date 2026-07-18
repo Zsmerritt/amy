@@ -1004,6 +1004,11 @@ void amy_overload_check(uint32_t render_us);
 void amy_overload_failsafe();
 void amy_set_render_load_threshold(float threshold);
 float amy_get_render_load();
+// Runtime partial-detail knob for the interp-partials (piano) engine
+// (see interp_partials.c): harmonics at/above this index are dropped, in
+// addition to the static drop map. Lower it to trade top-end detail for CPU.
+// Change only while no partials notes are held.
+extern uint8_t amy_partials_harmonic_limit;
 int amy_get_output_buffer(output_sample_type * samples);
 int amy_get_input_buffer(output_sample_type * samples);
 void amy_set_external_input_buffer(output_sample_type * samples);

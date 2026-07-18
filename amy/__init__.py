@@ -16,10 +16,14 @@ try:
     _render_load = _amy.render_load
     _set_render_load_threshold = _amy.set_render_load_threshold
     _dump_state = _amy.dump_state
+    _get_partials_harmonic_limit = _amy.get_partials_harmonic_limit
+    _set_partials_harmonic_limit = _amy.set_partials_harmonic_limit
 except (ImportError, AttributeError):
     # C module is not required? not available?
     # I'm guessing this might mean we're on Micropython?
     _set_cv_from_osc = lambda c, o: None
+    _get_partials_harmonic_limit = lambda: 255
+    _set_partials_harmonic_limit = lambda n: None
     try:
         import tulip
         _get_synth_commands = tulip.amy_get_synth_commands
@@ -606,3 +610,11 @@ def render_load():
 
 def set_render_load_threshold(t):
     _set_render_load_threshold(t)
+
+# Interp-partials (piano) harmonic detail limit: harmonics at/above this index
+# are dropped, trading top-end detail for CPU. Set only while no partials notes
+# are held. Default (and max) is 255 = full detail.
+def partials_harmonic_limit(limit=None):
+    if limit is None:
+        return _get_partials_harmonic_limit()
+    _set_partials_harmonic_limit(limit)

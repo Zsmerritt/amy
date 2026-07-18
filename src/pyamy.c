@@ -316,6 +316,19 @@ static PyObject *amy_set_render_load_threshold_wrapper(PyObject *self, PyObject 
     return Py_None;
 }
 
+static PyObject *amy_get_partials_harmonic_limit_wrapper(PyObject *self, PyObject *args) {
+    return Py_BuildValue("i", (int)amy_partials_harmonic_limit);
+}
+
+static PyObject *amy_set_partials_harmonic_limit_wrapper(PyObject *self, PyObject *args) {
+    int limit;
+    if (!PyArg_ParseTuple(args, "i", &limit)) return NULL;
+    if (limit < 0) limit = 0;
+    if (limit > UINT8_MAX) limit = UINT8_MAX;
+    amy_partials_harmonic_limit = (uint8_t)limit;
+    return Py_None;
+}
+
 static PyMethodDef c_amyMethods[] = {
     {"render_to_list", render_wrapper, METH_VARARGS, "Render audio"},
     {"send_wire", send_wrapper, METH_VARARGS, "Send a message"},
@@ -332,6 +345,8 @@ static PyMethodDef c_amyMethods[] = {
     {"ticks_ms", amy_ticks_ms_wrapper, METH_VARARGS, "Read AMY millisecond clock"},
     {"render_load", amy_get_render_load_wrapper, METH_VARARGS, "Read current render load fraction"},
     {"set_render_load_threshold", amy_set_render_load_threshold_wrapper, METH_VARARGS, "Set the fraction of CPU at which to trigger overload failsafe"},
+    {"get_partials_harmonic_limit", amy_get_partials_harmonic_limit_wrapper, METH_VARARGS, "Read the interp-partials harmonic detail limit"},
+    {"set_partials_harmonic_limit", amy_set_partials_harmonic_limit_wrapper, METH_VARARGS, "Set the interp-partials harmonic detail limit (trade top-end detail for CPU)"},
     { NULL, NULL, 0, NULL }
 };
 
