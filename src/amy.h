@@ -347,6 +347,30 @@ enum coefs{
 #define SYNTH_FLAGS_IGNORE_NOTE_OFFS 2  // Note offs are ignored (for drums with long decays)
 #define SYNTH_FLAGS_NEGATE_PEDAL 4      // Flip interpretation of MIDI pedals
 
+// MPE (MIDI Polyphonic Expression) zone state.
+// When num_members > 0, notes arriving on the zone's member channels are routed
+// to the master channel's synth, and each member channel's pitch bend (0xE0),
+// channel pressure (0xD0), and CC74 (timbre) apply per-note to the voices whose
+// notes arrived on that channel (via each osc's note_source_channel).
+// Default MPE member-channel pitch bend range in semitones, per the MPE spec.
+// (No 'f' suffix or trailing comment: this line is scraped into amy/constants.py.)
+#define MPE_DEFAULT_MEMBER_BEND_RANGE 48.0
+typedef struct mpe_state {
+    uint8_t num_members;      // 0 = MPE off.  1-15 member channels.
+    uint8_t master_channel;   // 1 (lower zone) or 16 (upper zone).
+    float member_bend_range;  // semitones for full-scale member-channel bend.
+    // Per-MIDI-channel expression, 1-indexed by channel.  Written by the MIDI
+    // task, read by the render loop once per block (single-word float writes,
+    // same discipline as amy_global.pitch_bend).
+    float channel_bend[17];      // in octaves, like amy_global.pitch_bend.
+    float channel_pressure[17];  // 0..1, read as ext0 by member-note oscs.
+    float channel_timbre[17];    // 0..1 (CC74), read as ext1 by member-note oscs.
+    // RPN state machine (CC101/CC100), per channel, for MPE Config (RPN 6) and
+    // pitch bend sensitivity (RPN 0).
+    uint8_t rpn_msb[17];
+    uint8_t rpn_lsb[17];
+} mpe_state_t;
+
 #define true 1
 #define false 0
 
@@ -574,6 +598,8 @@ typedef struct amy_event {
     uint8_t to_synth;  // For moving setup between synth numbers.
     uint8_t grab_midi_notes;  // To enable/disable automatic MIDI note-on/off generating note-on/off.
     uint8_t pedal;  // MIDI pedal value.
+    int16_t mpe_members;  // MPE zone config: number of member channels (0 = off).  Master channel is e->synth.
+    float mpe_bend_range;  // MPE member-channel pitch bend range in semitones (default 48).
     uint16_t num_voices;
     uint8_t oscs_per_voice;  // Used when initializing a synth without a patch.
     //
@@ -858,7 +884,8 @@ typedef struct global_state {
     uint8_t i2s_is_in_background;  // Flag not to handle I2S in amy_update.
     float volume[AMY_NUM_BUSES];  // Volume controls mix of buses into final output.
     float pitch_bend;  // Legacy global pitch bend, will be subsumed per-synth (instrument).
-    
+    mpe_state_t mpe;  // MPE zone config + per-channel expression.
+
     uint16_t delta_qsize;
     struct delta * delta_queue; // start of the sorted queue of deltas to execute.
     int16_t latency_ms;
@@ -1051,6 +1078,11 @@ extern void midi_mappings_deinit();
 extern void midi_clear_channel_mappings(int channel, int type);
 extern bool midi_mappings_exist_for_channel(int channel);
 extern void substitute_midi_special_values(char *dest, const char *src, int channel, int code, float value);
+// MPE (see mpe_state_t).  Channel args are 1-based MIDI channels.
+extern uint8_t amy_mpe_is_member_channel(uint8_t channel);
+extern uint8_t amy_mpe_synth_for_channel(uint8_t channel);
+extern void amy_mpe_config(uint8_t master_channel, int num_members, float bend_range);
+extern void amy_mpe_reset(void);
 extern void midi_msg_handler(uint8_t * bytes, uint16_t len, uint8_t is_sysex_unused, uint32_t time);
 // As midi_message_handler, but any events produced by the mapping are converted to deltas
 // on `queue` instead of being played, unless queue is NULL or the global delta queue.

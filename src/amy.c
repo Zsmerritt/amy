@@ -468,8 +468,9 @@ int8_t global_init(amy_config_t c) {
         amy_global.volume[bus] = 1.0f;
     amy_global.pitch_bend = 0;
     amy_global.latency_ms = 0;
-    amy_global.tempo = 108.0; 
+    amy_global.tempo = 108.0;
     amy_global.pitch_bend = 0;
+    amy_mpe_reset();
     amy_global.transfer_flag = AMY_TRANSFER_TYPE_NONE;
     amy_global.transfer_storage = NULL;
     amy_global.transfer_length_bytes = 0;
@@ -698,7 +699,16 @@ void amy_event_to_deltas_queue(amy_event *e, uint16_t base_osc, struct delta **q
     EVENT_TO_DELTA_WITH_BASEOSC(chained_osc, CHAINED_OSC)
     EVENT_TO_DELTA_WITH_BASEOSC(reset_osc, RESET_OSC)
     EVENT_TO_DELTA_WITH_BASEOSC(mod_source, MOD_SOURCE)
-    EVENT_TO_DELTA_I(note_source_channel, NOTE_SOURCE_CHANNEL)
+    // For note on/off, always stamp the source channel — including the "unset"
+    // value for non-MIDI notes. A voice previously played by an MPE member
+    // channel would otherwise keep its stale channel and apply that channel's
+    // per-note bend/pressure/timbre to a note sent from a sketch or the web
+    // keyboard.
+    if (AMY_IS_SET(e->velocity)) {
+        d.param = NOTE_SOURCE_CHANNEL; d.data.i = e->note_source_channel; add_delta_to_queue(&d, queue);
+    } else {
+        EVENT_TO_DELTA_I(note_source_channel, NOTE_SOURCE_CHANNEL)
+    }
     EVENT_TO_DELTA_I(filter_type, FILTER_TYPE)
     EVENT_TO_DELTA_I(algorithm, ALGORITHM)
     EVENT_TO_DELTA_I(eg_type[0], EG0_TYPE)
@@ -900,6 +910,9 @@ void amy_reset_oscs() {
     midi_mappings_deinit();
     midi_mappings_init();
     midi_active_channels_reset();
+    // Reset the MPE zone — synths are gone, so member-channel routing to them
+    // must not survive (the sketch's knob block re-enables it if it wants it).
+    amy_mpe_reset();
     cv_trigger_deinit();
     cv_trigger_init();
     cv_from_osc_deinit();
@@ -1598,6 +1611,16 @@ void hold_and_modify(uint16_t osc) {
     ctrl_inputs[COEF_BEND] = amy_global.pitch_bend;
     ctrl_inputs[COEF_EXT0] = cv_inputs[0];
     ctrl_inputs[COEF_EXT1] = cv_inputs[1];
+    // MPE: notes that arrived on an MPE member channel get that channel's
+    // per-note expression instead of the global bend / CV inputs.
+    {
+        uint8_t nsc = synth[osc]->note_source_channel;
+        if (AMY_IS_SET(synth[osc]->note_source_channel) && amy_mpe_is_member_channel(nsc)) {
+            ctrl_inputs[COEF_BEND] = amy_global.mpe.channel_bend[nsc];
+            ctrl_inputs[COEF_EXT0] = amy_global.mpe.channel_pressure[nsc];
+            ctrl_inputs[COEF_EXT1] = amy_global.mpe.channel_timbre[nsc];
+        }
+    }
 
     // copy all the modifier variables
     float logfreq = combine_controls(ctrl_inputs, synth[osc]->logfreq_coefs);

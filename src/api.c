@@ -172,6 +172,8 @@ void amy_clear_event(amy_event *e) {
     AMY_UNSET(e->synth_delay_ms);
     AMY_UNSET(e->grab_midi_notes);
     AMY_UNSET(e->pedal);
+    AMY_UNSET(e->mpe_members);
+    AMY_UNSET(e->mpe_bend_range);
     AMY_UNSET(e->num_voices);
     AMY_UNSET(e->sequence[SEQUENCE_TICK]);
     AMY_UNSET(e->sequence[SEQUENCE_PERIOD]);
