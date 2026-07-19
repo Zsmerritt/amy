@@ -257,11 +257,38 @@ TaskHandle_t amy_update_handle = NULL;
 // Who esp_render_task tells that it is done.
 TaskHandle_t amy_render_task_done_handle = NULL;
 
+// Per-core render-cycle counters.  Each core times its own amy_render() with the
+// CPU cycle counter and records both the most recent and the worst (max) per-block
+// delta, indexed by physical core id.  A host (e.g. a MicroPython binding) can read
+// these to see how close each core runs to the per-block budget -- useful for
+// judging and tuning the multicore oscillator split.
+//
+// Cost is a couple of cycle-counter reads, a subtract and a compare per block per
+// core (~20 cycles against a ~1.39M-cycle block budget at 240 MHz), so it does not
+// meaningfully perturb what it measures.  Each slot is written only by its own core
+// and aligned 32-bit stores are atomic, so there is no cross-core race.  The CPU
+// cycle counter wraps roughly every 18 s at 240 MHz; unsigned end-start subtraction
+// stays correct across a wrap because one render block is far shorter than 2^32
+// cycles.  The deltas include any preemption of the render (ISRs etc.), i.e. the
+// real wall-cycles spent before the block is done.
+#include "esp_cpu.h"
+volatile uint32_t amy_render_worst_cyc[2] = { 0, 0 };  // [core] max cycles/block since reset
+volatile uint32_t amy_render_last_cyc[2]  = { 0, 0 };  // [core] most recent block
+
+static inline void amy_render_timed(uint16_t start, uint16_t end, uint8_t core) {
+    uint32_t c0 = esp_cpu_get_cycle_count();
+    amy_render(start, end, core);
+    uint32_t dt = esp_cpu_get_cycle_count() - c0;
+    uint32_t cid = (uint32_t)esp_cpu_get_core_id() & 1;   // index by physical CPU, not the buffer arg
+    amy_render_last_cyc[cid] = dt;
+    if (dt > amy_render_worst_cyc[cid]) amy_render_worst_cyc[cid] = dt;
+}
+
 // Render the second core
 void esp_render_task( void * pvParameters) {
     while(1) {
         ulTaskNotifyTake(pdTRUE, portMAX_DELAY);  // from esp_render_on_cores
-        amy_render(0, AMY_OSCS/2, 1);
+        amy_render_timed(0, AMY_OSCS/2, 1);
         // Tell (someone) we're done.
         xTaskNotifyGive(amy_render_task_done_handle);  // to esp_render_on_cores
     }
@@ -275,12 +302,12 @@ void esp_render_on_cores() {
         // Tell the other core to start rendering.
         xTaskNotifyGive(amy_render_handle);  // to esp_render_task
         // Render me
-        amy_render(AMY_OSCS/2, AMY_OSCS, 0);
+        amy_render_timed(AMY_OSCS/2, AMY_OSCS, 0);
         // Wait for the other core to finish
         ulTaskNotifyTake(pdTRUE, portMAX_DELAY);  // from esp_render_task
     } else {
         // We render everything on this core.
-        amy_render(0, AMY_OSCS, 0);
+        amy_render_timed(0, AMY_OSCS, 0);
     }
 }
 
