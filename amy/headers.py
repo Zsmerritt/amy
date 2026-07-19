@@ -943,6 +943,37 @@ def _gamma_preset_rms():
     return table
 
 
+_GAMMA_PRESET_PEAK = None
+
+def _gamma_preset_peak():
+    """preset number -> sample PEAK as a fraction of full scale (0..1).
+
+    Computed from the same normalised sample data as _gamma_preset_rms(), so
+    the RMS-target gain and the peak cap speak the same units.  A short
+    high-crest transient (hat/rim) has a peak far above its 100 ms RMS, so the
+    RMS-target gain alone lets its peak overshoot full scale; this lets
+    make_drums_patch() cap that gain by peak instead of only by RMS.
+    """
+    global _GAMMA_PRESET_PEAK
+    if _GAMMA_PRESET_PEAK is not None:
+        return _GAMMA_PRESET_PEAK
+    import json
+    manifest = json.load(open('sounds/gamma9001/manifest.json'))
+    table = {}
+    rom_i = bin_i = 0
+    for m in manifest:
+        preset = rom_i if m['bank'] == GAMMA9001_ROM_BANK else GAMMA9001_PRESET_BASE + bin_i
+        if m['bank'] == GAMMA9001_ROM_BANK:
+            rom_i += 1
+        else:
+            bin_i += 1
+        d = _read_wav_mono16('sounds/gamma9001/' + m['file'])
+        x = np.asarray(d, dtype=np.float32) / 32768.0
+        table[preset] = float(np.max(np.abs(x))) if len(x) else 0.0
+    _GAMMA_PRESET_PEAK = table
+    return table
+
+
 def gamma_kit_to_drumkit(kit):
     """Resolve a {gm_note: (file, base_note)} kit to DRUMKIT-style tuples."""
     import json
@@ -979,6 +1010,14 @@ def make_drums_patch(drumkit=None, balance=False):
     # mapping that lands every voice at a consistent loudness target.
     # The gain goes in the midi_mapping's velocity scaling MAX.
     rms_table = _gamma_preset_rms() if balance else {}
+    peak_table = _gamma_preset_peak() if balance else {}
+    # Peak ceiling (fraction of full scale) the baked-in gain is not allowed to
+    # push a sample's PEAK past.  The RMS target alone is peak-blind, so a short
+    # transient reaching, say, -14 dBFS RMS can peak well above full scale and
+    # hard-clip the mix at moderate master volume.  1.25 sits just into the
+    # output soft-knee and clear of the hard limit, so the cap tames transient
+    # clipping and the drum loudness ceiling without dulling the attack.
+    PEAK_CAP = 1.25
     this_osc = 0
     for midi_note in range(AMY_MIDI_DRUMS_LOWEST_NOTE, AMY_MIDI_DRUMS_HIGHEST_NOTE + 1):
         pcm_preset_number, base_midi_note = drumkit[midi_note - AMY_MIDI_DRUMS_LOWEST_NOTE]
@@ -998,6 +1037,13 @@ def make_drums_patch(drumkit=None, balance=False):
                     target = -14.0
                 gain = 10.0 ** ((target - rms) / 20.0)
                 gain = min(3.0, max(0.33, gain))
+                # Peak-aware cap: never let gain drive the sample PEAK past
+                # PEAK_CAP.  Leaves low-crest sounds already near their RMS
+                # target (e.g. kicks) untouched, but pulls back high-crest
+                # transients whose RMS-target gain would overshoot full scale.
+                peak = peak_table.get(pcm_preset_number)
+                if peak is not None and peak > 0.0:
+                    gain = min(gain, PEAK_CAP / peak)
                 vel_scale = round(5.0 * gain, 2)
             message += amy.message(
                 midi_note_cmd=(
