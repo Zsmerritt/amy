@@ -57,6 +57,16 @@ const bool use_this_partial_map[MAX_NUM_HARMONICS] = {
 // a 6-note chord) plus a stray sine layered on each note.
 uint8_t amy_partials_harmonic_limit = MAX_NUM_HARMONICS;
 
+// Runtime SUSTAIN knob for the interp-partials (piano) engine: a time-stretch
+// multiplier applied to the per-partial dB envelope at note-on.  The piano's
+// decay is baked as breakpoint TIMES (piano_sample_times_ms, 4..4096 ms);
+// multiplying every inter-breakpoint delta by this factor plays the SAME
+// spectral trajectory more slowly, so the note rings ~factor-x longer without
+// changing its timbre.  1.0f == natural (bit-identical to stock; the multiply
+// is skipped).  Set via tulip.piano_sustain(); like amy_partials_harmonic_limit
+// it only affects NEW note-ons, so change it while no piano notes are held.
+float amy_partials_time_stretch = 1.0f;
+
 static inline bool use_partial(int h) {
     return h < amy_partials_harmonic_limit && use_this_partial_map[h];
 }
@@ -215,11 +225,25 @@ void _osc_on_with_harm_param(uint16_t o, float *harm_param, const interp_partial
     synth[o]->breakpoint_values[0][0] = 0;
     int last_time = 0;
     for (int bp = 0; bp < partials_voice->num_sample_times_ms; ++bp) {
-        synth[o]->breakpoint_times[0][bp + 1] = (partials_voice->sample_times_ms[bp] - last_time) * AMY_SAMPLE_RATE / 1000;
+        // Base inter-breakpoint delta in samples (stock computation).
+        uint32_t delta = (partials_voice->sample_times_ms[bp] - last_time) * AMY_SAMPLE_RATE / 1000;
+        // SUSTAIN: stretch every segment by the same factor so the whole
+        // spectral trajectory is preserved, just played slower => longer ring.
+        // At stretch==1.0f this is skipped, leaving `delta` bit-identical to
+        // stock.  breakpoint_times is uint32 samples: compute in double and
+        // clamp to UINT32_MAX so a large stretch can never wrap the field.
+        if (amy_partials_time_stretch != 1.0f) {
+            double stretched = (double)delta * (double)amy_partials_time_stretch;
+            delta = (stretched >= 4294967295.0) ? 4294967295u : (uint32_t)stretched;
+        }
+        synth[o]->breakpoint_times[0][bp + 1] = delta;
         synth[o]->breakpoint_values[0][bp + 1] = _env_lin_of_db(harm_param[bp + 1]);
         last_time = partials_voice->sample_times_ms[bp];
     }
-    // Final release
+    // Final release: deliberately NOT stretched.  This 200 ms ramp-to-zero is
+    // the terminal damp of the voice; keeping it fixed means key-up / voice end
+    // stays crisp regardless of the sustain setting (the audible ring is set by
+    // the stretched breakpoints above, which reach far past this tail).
     synth[o]->breakpoint_times[0][partials_voice->num_sample_times_ms + 1] = 200 * AMY_SAMPLE_RATE / 1000;
     synth[o]->breakpoint_values[0][partials_voice->num_sample_times_ms + 1] = 0;
     // Decouple osc freq and amp from note and amp.

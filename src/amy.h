@@ -125,6 +125,11 @@ extern const void *amy_flash_fence_hi;
 // Change only while no partials notes are held.
 extern uint8_t amy_partials_harmonic_limit;
 
+// Runtime SUSTAIN knob for the interp-partials (piano) engine
+// (see interp_partials.c): time-stretch multiplier for the baked per-partial
+// envelope. 1.0f = natural ring; larger rings longer. New note-ons only.
+extern float amy_partials_time_stretch;
+
 // Oscs below this floor are never auto-allocated to patch voices -- for hosts
 // that drive low-numbered oscs directly alongside the patch/instrument layer.
 extern uint16_t amy_reserved_oscs;
