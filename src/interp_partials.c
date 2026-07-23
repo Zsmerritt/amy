@@ -42,11 +42,31 @@ const bool use_this_partial_map[MAX_NUM_HARMONICS] = {
 // dropped in ADDITION to the static map. A sustained voice at full detail
 // runs ~24 partial oscs (~14% of a core); capping at 16 recovers roughly a
 // third of that for a subtle top-end change. Change it only while no
-// partials notes are held (note-off counts partials with the same rule).
+// partials notes are held.
+//
+// IMPORTANT (OPT-8 fix): the cap must only limit which partials SOUND.  The
+// voice's osc footprint (patch_oscs[] span, note-on shielding, note-off
+// release) is fixed by the STATIC map alone -- see
+// _span_partials_for_partials_voice() below.  Per-voice note events are
+// broadcast to EVERY osc in the voice's span (patches.c
+// patches_event_has_voices), and any span osc not marked
+// SYNTH_IS_ALGO_SOURCE gets note-on'd as a default full-price audible SINE
+// osc by the VELOCITY delta.  When the shield loop was cap-limited, lowering
+// the cap un-shielded (span - cap) oscs per voice, so LOWER detail cost MORE
+// CPU (measured inverted: cap 40 ~2.99M cyc, cap 15 ~3.67M, cap 8 ~3.89M for
+// a 6-note chord) plus a stray sine layered on each note.
 uint8_t amy_partials_harmonic_limit = MAX_NUM_HARMONICS;
 
 static inline bool use_partial(int h) {
     return h < amy_partials_harmonic_limit && use_this_partial_map[h];
+}
+
+// Number of partials this h index COULD use, ignoring the runtime cap: the
+// static-map count only.  This is the voice's reserved osc span (minus the
+// control osc) and matches the generated patch_oscs[] entry; it must NOT
+// shrink with amy_partials_harmonic_limit or span oscs escape shielding.
+static inline bool span_partial(int h) {
+    return use_this_partial_map[h];
 }
 
 
@@ -137,6 +157,17 @@ int _max_partials_for_partials_voice(const interp_partials_voice_t *partials_voi
         if (use_partial(h)) ++max_num_partials;
     }
     return max_num_partials;
+}
+
+// Cap-independent partial span of a voice (static map only).  Used for the
+// note-on shield and note-off release loops, which must always cover the
+// voice's FULL reserved osc range regardless of the current detail cap.
+int _span_partials_for_partials_voice(const interp_partials_voice_t *partials_voice) {
+    int span = 0;
+    for (int h = 0; h < partials_voice->num_harmonics[0]; ++h) {
+        if (span_partial(h)) ++span;
+    }
+    return span;
 }
 
 int interp_partials_max_partials_for_patch(int interp_partials_patch_number) {
@@ -258,9 +289,16 @@ void interp_partials_note_on(uint16_t osc) {
     // Make sure enough oscs are alloc'd in our dynamic osc alloc world.
     // This has to be enough for any note in this map.  Assume num_harmonics[0] is largest (lowest pitch).
     uint8_t max_num_partials = _max_partials_for_partials_voice(partials_voice);
+    // Alloc / shield over the voice's FULL cap-independent span: per-voice
+    // note events are broadcast to every osc in the span (patches.c), so
+    // every span osc must exist and be marked SYNTH_IS_ALGO_SOURCE or the
+    // VELOCITY delta note-ons it as a stray audible default-SINE osc.
+    // Oscs above the cap only need a default-size alloc (no 22-bp envelope);
+    // if the cap is later raised, ensure_osc_allocd grows them in place.
+    uint8_t span_num_partials = _span_partials_for_partials_voice(partials_voice);
     uint8_t max_num_breakpoints[MAX_BREAKPOINT_SETS] = {2 + partials_voice->num_sample_times_ms, DEFAULT_NUM_BREAKPOINTS};
-    for (int o = 0; o < max_num_partials; ++o) {
-        ensure_osc_allocd(osc + 1 + o, max_num_breakpoints);
+    for (int o = 0; o < span_num_partials; ++o) {
+        ensure_osc_allocd(osc + 1 + o, (o < max_num_partials) ? max_num_breakpoints : NULL);
     }
     int partial_osc = osc;
     for (int h = 0; h < num_harmonics; ++h) {
@@ -279,16 +317,23 @@ void interp_partials_note_on(uint16_t osc) {
             _osc_on_with_harm_param(partial_osc, harm_param, partials_voice);
         }
     }
-    // Make sure any remaining oscs are still marked as ALGO_SOURCE
-    while(partial_osc < osc + 1 + max_num_partials)  { synth[partial_osc]->status = SYNTH_IS_ALGO_SOURCE; ++partial_osc; }
+    // Make sure any remaining oscs are still marked as ALGO_SOURCE.
+    // Must cover the FULL span (not the capped count): this is the shield
+    // that keeps the per-voice broadcast VELOCITY delta from note-on'ing
+    // unused span oscs as stray audible sines (the OPT-8 CPU inversion).
+    while(partial_osc < osc + 1 + span_num_partials)  { synth[partial_osc]->status = SYNTH_IS_ALGO_SOURCE; ++partial_osc; }
 }
 
 void interp_partials_note_off(uint16_t osc) {
     //const interp_partials_voice_t *partials_voice = &interp_partials_map[synth[osc]->preset % NUM_INTERP_PARTIALS_PRESETS];
     //int num_oscs = partials_voice->num_harmonics[0];   // Assume first preset has the max #harmonics.
     int num_oscs = 0; //MAX_NUM_HARMONICS;
-    // Actual max num harmonics we may use is the number of 1s in the use_this_partial_map.
-    for (int i = 0; i < MAX_NUM_HARMONICS; ++i) num_oscs += use_partial(i) ? 1 : 0;
+    // Release the voice's FULL static-map span, NOT the cap-limited count:
+    // if the detail cap was raised or lowered between this note's on and off,
+    // partials beyond the current cap may still be sounding (or shield oscs
+    // may exist); marking them released is always safe (they're skipped or
+    // silent) and never leaves a partial ringing.
+    for (int i = 0; i < MAX_NUM_HARMONICS; ++i) num_oscs += span_partial(i) ? 1 : 0;
     for(uint16_t i = osc + 1; i < osc + 1 + num_oscs; i++) {
         uint16_t o = i % AMY_OSCS;
         if (synth[o]) {  // For high notes, some partials may be unused, unintialized (?)
