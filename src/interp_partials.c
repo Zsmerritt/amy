@@ -150,8 +150,34 @@ SAMPLE render_partials(SAMPLE *buf, uint16_t osc) {
             // envelope value are delayed by 1 frame compared to other oscs
             // so that partials fade in over one frame from zero amp.
             hold_and_modify(o);
-            //printf("[%d %d] %d amp %f (%f) freq %f (%f) on %d off %d bp0 %d %f bp1 %d %f wave %d\n", amy_global.total_blocks*AMY_BLOCK_SIZE, ms_since_started, o, synth[o]->amp, msynth[o]->amp, synth[o]->freq, msynth[o]->freq, synth[o]->note_on_clock, synth[o]->note_off_clock, synth[o]->breakpoint_times[0][0], 
+            //printf("[%d %d] %d amp %f (%f) freq %f (%f) on %d off %d bp0 %d %f bp1 %d %f wave %d\n", amy_global.total_blocks*AMY_BLOCK_SIZE, ms_since_started, o, synth[o]->amp, msynth[o]->amp, synth[o]->freq, msynth[o]->freq, synth[o]->note_on_clock, synth[o]->note_off_clock, synth[o]->breakpoint_times[0][0],
             //    synth[o]->breakpoint_values[0][0], synth[o]->breakpoint_times[1][0], synth[o]->breakpoint_values[1][0], synth[o]->wave);
+            // OPT: skip the 256-sample LUT pass for a partial that is EXACTLY
+            // silent at both ends of this block.  Exact zero is genuinely
+            // reachable here (it is not a float near-miss): the baked per-partial
+            // dB envelope is floored to 0 by _env_lin_of_db() below (anything
+            // under ~-60 dB returns 0), and amp_combine_controls() applies a
+            // second hard floor (`result <= AMP_THRESH_PLUS -> 0`).  A piano's
+            // high partials hit that floor within ~1 s of note-on and then stay
+            // there for the whole ring, so without this test a decaying note
+            // costs exactly as much CPU as a struck one.
+            //
+            // Safety: this is the same guard render_osc_wave() applies to
+            // ordinary oscs (amy.c, `!(msynth[osc]->amp == 0 && msynth[osc]->last_amp == 0)`),
+            // with the same fields and the same semantics.  render_partial ramps
+            // linearly from last_amp to amp across the block, so requiring BOTH
+            // endpoints to be zero means the block we drop is identically zero
+            // sample-for-sample (current_amp starts at 0 with a 0 increment, and
+            // MULA_SS(sample, 0) == 0 exactly in both the float and fixed-point
+            // builds) -- it can never truncate a ramp.  A partial ramping DOWN to
+            // zero still renders its final block (last_amp != 0), and one ramping
+            // UP from zero still renders (amp != 0), so no discontinuity is
+            // possible.  hold_and_modify() above is deliberately NOT skipped: the
+            // envelope must keep advancing so a partial that comes back is
+            // correct.  render_partial's trailing `last_amp = amp` is also safe to
+            // miss -- both are already 0 here, and hold_and_modify redoes exactly
+            // that assignment at the top of every block for PARTIAL oscs.
+            if (msynth[o]->amp == 0 && msynth[o]->last_amp == 0)  continue;
             SAMPLE value = render_partial(buf, o);
             //fprintf(stderr, "render_partials: time %.3f osc %d ctl ampt %.6f msynth_amp %.6f max_val=%.6f\n", amy_global.time, o, msynth[osc]->amp, msynth[o]->amp, S2F(value));
             if (value > max_value) max_value = value;
