@@ -365,7 +365,14 @@ extern volatile uint8_t amy_echo_silent_skip;
 // that small is already at its final value.  The cost of the margin is only
 // more silent blocks before the skip engages, on a bus that is by definition
 // idle.
-#define AMY_ECHO_TAIL_RESIDUE 1e-6f
+//
+// Spelled as a dotted decimal, NOT 1e-6f: the Makefile's src/patches.h rule
+// scrapes this header for `#define NAME <number>` and emits amy/constants.py,
+// and its sed only strips a trailing `f` from decimals containing a dot
+// (s/\([-0-9][0-9]*\.[0-9]*\)f.*/\1/).  Scientific notation slips the `f`
+// through and produces `AMY_ECHO_TAIL_RESIDUE=1e-6f`, which is not valid
+// Python -- the C compiles fine and the WEB/header build breaks instead.
+#define AMY_ECHO_TAIL_RESIDUE 0.000001f
 
 // D is how close the sample gets to the clip limit before the nonlinearity engages.  
 // So D=0.1 means output is linear for -0.9..0.9, then starts clipping.
