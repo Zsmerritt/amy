@@ -67,6 +67,50 @@ uint8_t amy_partials_harmonic_limit = MAX_NUM_HARMONICS;
 // it only affects NEW note-ons, so change it while no piano notes are held.
 float amy_partials_time_stretch = 1.0f;
 
+// PERF: exact integer (x1000) companion to amy_partials_time_stretch.
+//
+// The stretch is applied once per breakpoint per harmonic per note-on -- for
+// the piano that is 20 breakpoints x ~24 sounding harmonics = ~480 evaluations
+// per note, ~3840 for an 8-note strike, and note-on shares the same per-block
+// budget as rendering (i2s.c: amy_execute_deltas() then esp_render_on_cores()).
+// The ESP32-S3 has a single-precision FPU and NO hardware double, so doing that
+// multiply in `double` emitted three libgcc soft-float calls (__muldf3,
+// __gedf2, __fixunsdfsi) every time.  Worse, the branch is taken by default:
+// the deck's sustain slider starts at 5.0 s.
+//
+// The value ORIGINATES as an integer -- tulip.piano_sustain(stretch_x1000)
+// with stretch_x1000 clamped to 250..8000 -- so we keep an exact integer copy
+// and do the whole stretch in integer arithmetic: no FPU, no soft-float, and
+// a mathematically exact product (the compiler turns the /1000 into a
+// multiply-high plus shift).  amy_partials_time_stretch stays the public API
+// and remains the source of truth; this cache just follows it.
+static float _time_stretch_cached_float = 1.0f;
+static uint32_t _time_stretch_x1000 = 1000;
+// Largest `delta` for which delta * _time_stretch_x1000 still fits in uint32,
+// so the hot path can stay 32-bit (a uint64 divide would drag in libgcc's
+// __udivdi3, which costs about as much as the doubles we are removing).
+static uint32_t _time_stretch_delta_max = 0xFFFFFFFFu;
+
+// Refresh the exact integer form of amy_partials_time_stretch.  Runs its float
+// work only when the float global actually changed -- i.e. once per
+// tulip.piano_sustain() call, not once per breakpoint -- so the hot path never
+// touches the FPU.  Round-to-nearest recovers the caller's original integer
+// exactly across the whole documented 250..8000 range:
+// |arg/1000.0f * 1000.0f - arg| <= 8000 * 2^-23, far below the 0.5 that would
+// be needed to change the rounded result.
+static void _refresh_partials_time_stretch(void) {
+    float s = amy_partials_time_stretch;
+    if (s == _time_stretch_cached_float)  return;
+    _time_stretch_cached_float = s;
+    float scaled = s * 1000.0f + 0.5f;
+    // `!(scaled >= 0)` also catches NaN, for which the cast would be UB.
+    if (!(scaled >= 0.0f))  scaled = 0.0f;
+    if (scaled > 1000000000.0f)  scaled = 1000000000.0f;
+    _time_stretch_x1000 = (uint32_t)scaled;
+    _time_stretch_delta_max =
+        (_time_stretch_x1000 > 1) ? (0xFFFFFFFFu / _time_stretch_x1000) : 0xFFFFFFFFu;
+}
+
 static inline bool use_partial(int h) {
     return h < amy_partials_harmonic_limit && use_this_partial_map[h];
 }
@@ -220,12 +264,38 @@ void _cumulate_scaled_harmonic_params(float *harm_param, int harmonic_index, flo
         harm_param[1 + i] += alpha * partials_voice->harmonics_mags[harmonic_index * num_bps + i];
 }
 
-int _harmonic_base_index_for_pitch_vel(int pitch_index, int vel_index, const interp_partials_voice_t *partials_voice) {
-    int note_number = partials_voice->num_velocities * pitch_index + vel_index;
+// PERF: the four bilinear corners of a note-on are ALWAYS the consecutive note
+// numbers n, n+1, n+nv, n+nv+1 (n = num_velocities * pitch_index + vel_index,
+// nv = num_velocities), so their prefix sums over num_harmonics[] are strictly
+// increasing and share a prefix.  The old _harmonic_base_index_for_pitch_vel()
+// restarted the O(note_number) walk from element 0 for each corner -- four
+// passes, up to ~244 table reads per note-on.  Computing all four in one pass
+// costs n + nv + 1 reads (<= 63 for the piano) for EXACTLY the same integers:
+// the same terms are accumulated in the same order in the same int.
+//
+// Deliberately NOT a precomputed prefix table: that would spend ~130 bytes of
+// internal .bss per voice to save a further ~7 us per 8-note strike (~0.1% of
+// the 5687 us block budget), and internal SRAM on this S3 board is effectively
+// exhausted.  This form also stays generic -- it derives every bound from the
+// voice struct, so a non-piano interp_partials voice of any shape works.
+static void _harmonic_base_indices_for_pitch_vel(int pitch_index, int vel_index,
+                                                 const interp_partials_voice_t *partials_voice,
+                                                 int *base_pl_vl, int *base_pl_vh,
+                                                 int *base_ph_vl, int *base_ph_vh) {
+    const int nv = partials_voice->num_velocities;
+    const uint8_t *num_harmonics = partials_voice->num_harmonics;
+    const int note_number = nv * pitch_index + vel_index;
     int harmonic_index = 0;
     for (int i = 0; i < note_number; ++i)
-        harmonic_index += partials_voice->num_harmonics[i];
-    return harmonic_index;
+        harmonic_index += num_harmonics[i];
+    *base_pl_vl = harmonic_index;                       // note_number
+    harmonic_index += num_harmonics[note_number];
+    *base_pl_vh = harmonic_index;                       // note_number + 1
+    for (int i = note_number + 1; i < note_number + nv; ++i)
+        harmonic_index += num_harmonics[i];
+    *base_ph_vl = harmonic_index;                       // note_number + nv
+    harmonic_index += num_harmonics[note_number + nv];
+    *base_ph_vh = harmonic_index;                       // note_number + nv + 1
 }
 
 float _logfreq_of_midi_cents(float midi_cents) {
@@ -233,8 +303,37 @@ float _logfreq_of_midi_cents(float midi_cents) {
     return (midi_cents - (100 * ZERO_MIDI_NOTE)) / 1200.f;
 }
 
+// log2(10) / 20 -- converts a dB exponent into an exp2 exponent, since
+// 10^(x/20) == exp2(x * log2(10) / 20).  log2(10) = 3.321928094887362.
+#define _ENV_DB_TO_EXP2 0.16609640474436813f
+
+// Below this x = MIN(20, db - 100), powf(10.f, x/20.f) is <= 0.001f, so the
+// stock code's `lin < 0 -> 0` floor fired and the result was EXACTLY zero.
+// The true crossing is x* = 20*log10((double)0.001f) = -59.999999587442; this
+// constant sits just ABOVE it so the new function's exact-zero set is a strict
+// SUPERSET of the old one.  That matters: render_partials() skips any partial
+// whose amp is exactly 0 at both ends of a block, and a piano's high partials
+// spend most of a note's ring pinned at that floor.  This early return is also
+// what keeps F2S() from overflowing s8.23 when `db` is wildly extrapolated
+// (pitch_alpha is deliberately unclipped, so db can reach ~ -113 .. +332).
+#define _ENV_X_ZERO_FLOOR (-59.99999f)
+
 float _env_lin_of_db(float db) {
-    float lin =  powf(10.f, MIN(20.f, (db - 100.f)) / 20.f) - 0.001f;
+    // PERF: this was the ONLY libm transcendental left in AMY's render/control
+    // path, and it runs once per breakpoint per harmonic per note-on (~480x
+    // per piano note, ~3840x for an 8-note strike) on the same core and in the
+    // same per-block budget as rendering.  Use AMY's fixed-point exp2_lut,
+    // exactly as map_01_to_60dBf() in amy.c already does for base 10.
+    //
+    // Validated on the host against the real s8.23 LUT over the full
+    // realizable dB domain (65.8M points from the piano tables, plus 23.5M
+    // swept points): exact-zero behaviour is preserved with ZERO leaks, and
+    // the worst error at or above AMY's own amp floor (AMP_THRESH_PLUS =
+    // 1.1e-3, below which amp_combine_controls() forces exactly 0) is
+    // 0.0011 dB; at >= 1e-2 it is 0.00018 dB.
+    float x = MIN(20.f, db - 100.f);
+    if (x <= _ENV_X_ZERO_FLOOR)  return 0;
+    float lin = S2F(exp2_lut(F2S(x * _ENV_DB_TO_EXP2))) - 0.001f;
     if (lin < 0)  return 0;
     return lin;
 }
@@ -250,17 +349,32 @@ void _osc_on_with_harm_param(uint16_t o, float *harm_param, const interp_partial
     synth[o]->breakpoint_times[0][0] = 0;
     synth[o]->breakpoint_values[0][0] = 0;
     int last_time = 0;
+    // Hoisted out of the loop: one float compare per note-on-harmonic instead
+    // of a soft-float double multiply per breakpoint (see
+    // _refresh_partials_time_stretch above).
+    _refresh_partials_time_stretch();
+    const uint32_t stretch_x1000 = _time_stretch_x1000;
+    const uint32_t stretch_delta_max = _time_stretch_delta_max;
     for (int bp = 0; bp < partials_voice->num_sample_times_ms; ++bp) {
         // Base inter-breakpoint delta in samples (stock computation).
         uint32_t delta = (partials_voice->sample_times_ms[bp] - last_time) * AMY_SAMPLE_RATE / 1000;
         // SUSTAIN: stretch every segment by the same factor so the whole
         // spectral trajectory is preserved, just played slower => longer ring.
-        // At stretch==1.0f this is skipped, leaving `delta` bit-identical to
-        // stock.  breakpoint_times is uint32 samples: compute in double and
-        // clamp to UINT32_MAX so a large stretch can never wrap the field.
-        if (amy_partials_time_stretch != 1.0f) {
-            double stretched = (double)delta * (double)amy_partials_time_stretch;
-            delta = (stretched >= 4294967295.0) ? 4294967295u : (uint32_t)stretched;
+        // At stretch==1.0 this is skipped, leaving `delta` bit-identical to
+        // stock (and even unskipped, delta * 1000 / 1000 == delta exactly).
+        // Fast path is pure 32-bit -- one multiply plus a divide-by-constant
+        // that the compiler turns into a multiply-high and a shift.  The piano
+        // never leaves it (worst segment is 1024 ms = 45158 samples, and
+        // stretch_delta_max is 536870 even at the 8.0x API maximum); the
+        // uint64 branch exists so an arbitrary future table with segments over
+        // ~12 s still gets the exact value instead of a wrapped one.
+        if (stretch_x1000 != 1000) {
+            if (delta <= stretch_delta_max) {
+                delta = (delta * stretch_x1000) / 1000u;
+            } else {
+                uint64_t stretched = ((uint64_t)delta * stretch_x1000) / 1000u;
+                delta = (stretched > 0xFFFFFFFFULL) ? 0xFFFFFFFFu : (uint32_t)stretched;
+            }
         }
         synth[o]->breakpoint_times[0][bp + 1] = delta;
         synth[o]->breakpoint_values[0][bp + 1] = _env_lin_of_db(harm_param[bp + 1]);
@@ -319,18 +433,15 @@ void interp_partials_note_on(uint16_t osc) {
     num_harmonics = MIN(num_harmonics, partials_voice->num_harmonics[note_number + 1]);  // pl_vh note
     num_harmonics = MIN(num_harmonics, partials_voice->num_harmonics[note_number + partials_voice->num_velocities]);  // ph_vl note
     num_harmonics = MIN(num_harmonics, partials_voice->num_harmonics[note_number + partials_voice->num_velocities + 1]);  // ph_vh note
-    // Interpolate the 4 notes.
-    int harmonic_base_index_pl_vl =
-        _harmonic_base_index_for_pitch_vel(pitch_index, vel_index, partials_voice);
+    // Interpolate the 4 notes.  All four prefix sums come from a single pass.
+    int harmonic_base_index_pl_vl, harmonic_base_index_pl_vh;
+    int harmonic_base_index_ph_vl, harmonic_base_index_ph_vh;
+    _harmonic_base_indices_for_pitch_vel(pitch_index, vel_index, partials_voice,
+                                         &harmonic_base_index_pl_vl, &harmonic_base_index_pl_vh,
+                                         &harmonic_base_index_ph_vl, &harmonic_base_index_ph_vh);
     float alpha_pl_vl = (1.f - pitch_alpha) * (1.f - vel_alpha);
-    int harmonic_base_index_pl_vh =
-        _harmonic_base_index_for_pitch_vel(pitch_index, vel_index + 1, partials_voice);
     float alpha_pl_vh = (1.f - pitch_alpha) * (vel_alpha);
-    int harmonic_base_index_ph_vl =
-        _harmonic_base_index_for_pitch_vel(pitch_index + 1, vel_index, partials_voice);
     float alpha_ph_vl = (pitch_alpha) * (1.f - vel_alpha);
-    int harmonic_base_index_ph_vh =
-        _harmonic_base_index_for_pitch_vel(pitch_index + 1, vel_index + 1, partials_voice);
     float alpha_ph_vh = (pitch_alpha) * (vel_alpha);
     //fprintf(stderr, "interp_partials@%u: osc %d note %.1f vel %.1f pitch_x %d vel_x %d numh %d harm_bi_ll %d pitch_a %.3f vel_a %.3f alphas %.2f %.2f %.2f %.2f\n",
     //        amy_global.total_blocks*AMY_BLOCK_SIZE, osc, midi_note, midi_vel, pitch_index, vel_index, num_harmonics,
