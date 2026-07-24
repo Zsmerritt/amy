@@ -766,6 +766,16 @@ struct synthinfo {
     SAMPLE pcm_last_out;   // last output value this PCM osc rendered (post-amp), for declick
     SAMPLE pcm_declick;    // decaying offset canceling PCM waveform discontinuities
     SAMPLE last_scale[MAX_BREAKPOINT_SETS];  // remembers current envelope level, to use as start point in release.
+    // Breakpoint-scan freeze cache, see compute_breakpoint_scale().  Once a held
+    // note's elapsed time has passed every defined segment the envelope is in
+    // "sustain" and returns a constant (== last_scale[bp_set]) until note-off or
+    // retrigger, so the ~2x20-iteration rescan can be skipped entirely.
+    // bp_frozen_note_on_clock[] snapshots the note_on_clock the freeze was taken
+    // at: note-off UNSETs note_on_clock (-> UINT32_MAX, never a snapshot value)
+    // and a retrigger writes a fresh one, so either one breaks the compare.
+    // Every write to breakpoint_times[]/breakpoint_values[] clears bp_frozen[].
+    uint8_t bp_frozen[MAX_BREAKPOINT_SETS];
+    uint32_t bp_frozen_note_on_clock[MAX_BREAKPOINT_SETS];
     SAMPLE last_two[2];    // For ALGO feedback ops
     // For filters.  Need 2x because LPF24 uses two instances of filter.
     SAMPLE filter_delay[2 * FILT_NUM_DELAYS];

@@ -1063,7 +1063,14 @@ void reset_osc_state(struct synthinfo *psynth) {
     psynth->mod_value = F2S(0);
     psynth->pcm_last_out = 0;
     psynth->pcm_declick = 0;
-    for(uint8_t j=0;j<MAX_BREAKPOINT_SETS;j++) { psynth->last_scale[j] = 0; }
+    for(uint8_t j=0;j<MAX_BREAKPOINT_SETS;j++) {
+        psynth->last_scale[j] = 0;
+        // Drop the compute_breakpoint_scale() sustain freeze; reset_osc_params()
+        // (always paired with this via reset_osc_by_pointer) rewrites the
+        // breakpoint arrays, and alloc_osc() gets here on fresh (garbage) RAM.
+        psynth->bp_frozen[j] = 0;
+        psynth->bp_frozen_note_on_clock[j] = 0;
+    }
     psynth->last_two[0] = 0;
     psynth->last_two[1] = 0;
     for(int j = 0; j < 2 * FILT_NUM_DELAYS; ++j) psynth->filter_delay[j] = 0;
@@ -1234,6 +1241,10 @@ void ensure_osc_allocd(int osc, uint8_t *max_num_breakpoints) {
                     AMY_UNSET(synth[osc]->breakpoint_times[i][j]);
                     AMY_UNSET(synth[osc]->breakpoint_values[i][j]);
                 }
+                // The breakpoint arrays just moved and were rewritten (and the
+                // struct copy above carried the old flags over): drop any
+                // compute_breakpoint_scale() sustain freeze.
+                synth[osc]->bp_frozen[i] = 0;
             }
         }
     }
@@ -1424,6 +1435,10 @@ void osc_note_on(uint16_t osc, float initial_freq) {
     //fprintf(stderr,"Note on: osc %d wav %d note %.3f vel %.3f\n",
     //        osc, synth[osc]->wave,
     //        synth[osc]->midi_note, synth[osc]->velocity);
+    // A note-on restarts the envelopes; drop any sustain freeze.  (The
+    // note_on_clock key below already invalidates it, but some *_note_on()
+    // callees rewrite the breakpoint arrays, so clear it explicitly too.)
+    for (uint8_t j = 0; j < MAX_BREAKPOINT_SETS; ++j)  synth[osc]->bp_frozen[j] = 0;
     // take care of fm & ks first -- no special treatment for bp/mod
     switch (synth[osc]->wave) {
     case KS: if(amy_global.config.ks_oscs) ks_note_on(osc); break;
@@ -1576,6 +1591,9 @@ void play_delta(struct delta *d) {
         } else {
             synth[d->osc]->breakpoint_values[bp_set][(pos-1) / 2] = d->data.f;
         }
+        // A bp edit mid-note changes what compute_breakpoint_scale() would
+        // return, so any cached sustain value for this set is now stale.
+        synth[d->osc]->bp_frozen[bp_set] = 0;
     }
 
     if (PARAM_IS_COMBO_COEF(d->param, AMP) ||
@@ -1823,7 +1841,15 @@ float amp_combine_controls(float *controls, float *coefs) {
         float val = controls[i];
         if (i == COEF_CONST)  {val = coef; coef = 1.0f;}   // coef[CONST] is always 1.0f, so swap them.  We're going to map the val.
         if (i != COEF_MOD && i != COEF_MOD1) {
-            val = map_60dB_to_01f(MAX(0, val)) - 1.0;    // const, vel, eg0, eg1 get log-compressed.
+            // 1.0f, not 1.0: the ESP32-S3 FPU is single-precision only, so a
+            // double literal here would mean a soft-float __extendsfdf2 +
+            // __subdf3 + __truncdfsf2 per nonzero amp coef.  (Measured with
+            // xtensa-esp32s3-elf-gcc 14.2: at -O0 that is exactly what the
+            // double literal emitted; from -Og up, including the firmware's
+            // -O2, GCC already narrows it back to a float subtract and the
+            // generated code is byte-identical either way.  Keeping the f
+            // suffix so the source says what the hardware actually does.)
+            val = map_60dB_to_01f(MAX(0, val)) - 1.0f;    // const, vel, eg0, eg1 get log-compressed.
             // make 0 mean "no amp" and 1 mean "regular (full) amp".
         }
         result += coef * val;
@@ -1876,19 +1902,31 @@ void hold_and_modify(uint16_t osc) {
         msynth[osc]->logfreq = logfreq + synth[osc]->portamento_alpha * (msynth[osc]->last_logfreq - logfreq);
     }
     msynth[osc]->last_logfreq = msynth[osc]->logfreq;
-    float filter_logfreq = combine_controls(ctrl_inputs, synth[osc]->filter_logfreq_coefs);
-    if (filter_logfreq < MIN_FILTER_LOGFREQ)  filter_logfreq = MIN_FILTER_LOGFREQ;
-    if (AMY_IS_SET(msynth[osc]->last_filter_logfreq)) {
-        #define MAX_DELTA_FILTER_LOGFREQ_DOWN 3.0f
-        float last_logfreq = msynth[osc]->last_filter_logfreq;
-        if (filter_logfreq < (last_logfreq - (MAX_DELTA_FILTER_LOGFREQ_DOWN / synth[osc]->resonance))) {
-            // Filter cutoff downward slew-rate limit.
-            // See https://github.com/shorepine/amy/issues/126
-            filter_logfreq = last_logfreq - (MAX_DELTA_FILTER_LOGFREQ_DOWN / synth[osc]->resonance);
+    // msynth[osc]->filter_logfreq is consumed *only* by filter_process(), which
+    // render_osc_wave() gates on filter_type != FILTER_NONE.  For an unfiltered
+    // osc (all PARTIALs, so all ~200 piano partials) the dot product plus the
+    // real float division below is pure waste, every osc, every block.
+    #define MAX_DELTA_FILTER_LOGFREQ_DOWN 3.0f
+    if (synth[osc]->filter_type == FILTER_NONE) {
+        // Leave filter_logfreq alone (nothing can read it while the filter is
+        // off) but UNSET the slew history, so that if a filter is switched on
+        // mid-note the cutoff starts from the freshly computed value instead of
+        // being slew-limited against a value accumulated while it was bypassed.
+        AMY_UNSET(msynth[osc]->last_filter_logfreq);
+    } else {
+        float filter_logfreq = combine_controls(ctrl_inputs, synth[osc]->filter_logfreq_coefs);
+        if (filter_logfreq < MIN_FILTER_LOGFREQ)  filter_logfreq = MIN_FILTER_LOGFREQ;
+        if (AMY_IS_SET(msynth[osc]->last_filter_logfreq)) {
+            float last_logfreq = msynth[osc]->last_filter_logfreq;
+            if (filter_logfreq < (last_logfreq - (MAX_DELTA_FILTER_LOGFREQ_DOWN / synth[osc]->resonance))) {
+                // Filter cutoff downward slew-rate limit.
+                // See https://github.com/shorepine/amy/issues/126
+                filter_logfreq = last_logfreq - (MAX_DELTA_FILTER_LOGFREQ_DOWN / synth[osc]->resonance);
+            }
         }
+        msynth[osc]->last_filter_logfreq = filter_logfreq;
+        msynth[osc]->filter_logfreq = filter_logfreq;
     }
-    msynth[osc]->last_filter_logfreq = filter_logfreq;
-    msynth[osc]->filter_logfreq = filter_logfreq;
     msynth[osc]->duty = combine_controls(ctrl_inputs, synth[osc]->duty_coefs);
 
     msynth[osc]->last_pan = msynth[osc]->pan;
