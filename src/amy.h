@@ -125,6 +125,18 @@ extern const void *amy_flash_fence_hi;
 // Change only while no partials notes are held.
 extern uint8_t amy_partials_harmonic_limit;
 
+// The knob above is a HARMONIC INDEX, not a partial count: the static
+// use_this_partial_map[] drops some higher harmonics, so a limit of 20 renders
+// only 18 partials and everything above the map's last 1 renders the same
+// count. These two turn that into an honest "how many partials sound" API:
+//   amy_partials_max_count()            -- total partials the map allows (24).
+//   amy_partials_limit_for_count(n)     -- the SMALLEST amy_partials_harmonic_limit
+//                                          that renders exactly n partials,
+//                                          clamped to [1, amy_partials_max_count()].
+// The map itself is the single source of truth for both (never a copied table).
+extern uint16_t amy_partials_max_count(void);
+extern uint16_t amy_partials_limit_for_count(uint16_t want_count);
+
 // Runtime SUSTAIN knob for the interp-partials (piano) engine
 // (see interp_partials.c): time-stretch multiplier for the baked per-partial
 // envelope. 1.0f = natural ring; larger rings longer. New note-ons only.

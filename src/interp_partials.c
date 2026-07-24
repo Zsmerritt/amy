@@ -115,6 +115,44 @@ static inline bool use_partial(int h) {
     return h < amy_partials_harmonic_limit && use_this_partial_map[h];
 }
 
+// --- honest partial-COUNT API over the harmonic-index knob -----------------
+//
+// amy_partials_harmonic_limit is a harmonic INDEX cap, and use_this_partial_map
+// is sparse above harmonic 17, so the two numbers diverge: limit 20 renders 18
+// partials, limit 24 renders 19, and every limit from 35 up renders the same
+// 24. A UI that shows the limit therefore lies about what it is buying. These
+// helpers invert the map so a host can speak in partials actually rendered.
+//
+// Both WALK use_this_partial_map -- it is the single source of truth. Do not
+// mirror its contents into a constant table anywhere; a table would silently
+// drift the day the map changes.
+
+// Total partials the static map allows (24 with the map above) -- i.e. the
+// count rendered at amy_partials_harmonic_limit == MAX_NUM_HARMONICS.
+uint16_t amy_partials_max_count(void) {
+    uint16_t n = 0;
+    for (int h = 0; h < MAX_NUM_HARMONICS; ++h)
+        if (use_this_partial_map[h]) ++n;
+    return n;
+}
+
+// The SMALLEST amy_partials_harmonic_limit that renders exactly want_count
+// partials: one past the index of the want_count'th enabled harmonic. Counts
+// below 1 or above the map's total clamp to the achievable end, so every
+// return value is a limit whose rendered count is exactly the clamped request
+// (never a silent off-by-one).
+uint16_t amy_partials_limit_for_count(uint16_t want_count) {
+    if (want_count < 1) want_count = 1;
+    uint16_t n = 0;
+    for (int h = 0; h < MAX_NUM_HARMONICS; ++h) {
+        if (use_this_partial_map[h]) {
+            if (++n == want_count) return (uint16_t)(h + 1);
+        }
+    }
+    // want_count exceeded the map's total: full detail.
+    return (uint16_t)MAX_NUM_HARMONICS;
+}
+
 // Number of partials this h index COULD use, ignoring the runtime cap: the
 // static-map count only.  This is the voice's reserved osc span (minus the
 // control osc) and matches the generated patch_oscs[] entry; it must NOT
