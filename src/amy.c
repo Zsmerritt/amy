@@ -187,6 +187,22 @@ volatile uint32_t amy_patch_loading = 0;
 // control task (REPL), read by the fill task; single-byte flag sampled once
 // per bus per block, so no atomics needed and either value is always sane.
 volatile uint8_t amy_eq_silent_skip = 1;
+// Same switch for the silent-bus CHORUS and ECHO skips (see
+// AMY_CHORUS_TAIL_BLOCKS in amy.h and echo_tail_blocks() below). 1 (default):
+// the effect stops once its silence countdown expires, delay line frozen.
+// 0: the pre-skip behavior -- the effect runs its full per-sample loop on
+// every block for as long as its level is > 0, however long the bus has been
+// silent. Read once per bus per block by the fill task; a "my chorus sounds
+// different" report can be A/B'd from the REPL with no reflash.
+volatile uint8_t amy_chorus_silent_skip = 1;
+volatile uint8_t amy_echo_silent_skip = 1;
+#ifdef AMY_FX_SKIP_PROBE
+// Non-vacuity instrumentation for the host A/B harness only (never compiled
+// into firmware): how many silent blocks each skip actually elided, and how
+// many blocks each effect actually ran.
+uint32_t amy_chorus_blocks_skipped = 0, amy_chorus_blocks_run = 0;
+uint32_t amy_echo_blocks_skipped = 0, amy_echo_blocks_run = 0;
+#endif
 // Per-core bitmask of buses that received any osc mix this block (OPT-11).
 // fbl[core][bus] is cleared LAZILY on first use; a bus absent from both
 // cores' masks holds stale data and every consumer below must (and does)
@@ -299,6 +315,63 @@ static void fx_flush_delay_line(delay_line_t *delay_line) {
         bzero(delay_line->samples, delay_line->len * sizeof(SAMPLE));
 }
 
+// How many blocks of KNOWN-ZERO input a bus's echo must keep running before
+// its delay line can be frozen and the echo skipped (see echo_config_t::
+// tail_blocks).  Closed form; call with the POST-CLAMP feedback/filter_coef.
+// UINT32_MAX means "never skip this configuration".
+//
+//   y[n] = x[n] + fb * y[n-D]        (delay_line_in_out_fixed_delay)
+//
+// ---- Why FEEDBACK != 0 is excluded -------------------------------------
+// Freezing is only sound if further running could not change what the line
+// emits.  With feedback, in THIS fixed-point implementation, it never stops
+// changing, because the loop does not decay to zero -- it LATCHES.  SMULR6
+// quantizes its second operand in steps of 2048 counts and rounds:
+//     SMULR6(a, b) == (1 + ((a + 1024) >> 11) * ((b + 1024) >> 11)) >> 1
+// so for fb = 0.9 the map y -> SMULR6(fb, y) has fixed points at y = 1843,
+// 3686, 5529 and 7372 counts.  Each of the D residue classes of the ring
+// latches at whichever of those it lands on, so the line settles to a
+// NON-CONSTANT standing pattern that circulates forever: measured on the host
+// A/B harness, a feedback-0.9 echo is still emitting +-3 LSB of int16 output
+// 99 seconds after the last note-off, and it would do so indefinitely.  Since
+// the read tap is relative to the write index, freezing a non-constant ring
+// rotates that pattern, which is a real (if -81 dBFS) difference -- so we do
+// not freeze it.  A feedback echo in AMY is never idle; there is nothing to
+// skip.  (The residue is arguably a bug worth fixing on its own; killing it
+// as a side effect of a performance change is not this commit's job.)
+// With feedback == 0 there is no loop at all: the line holds
+//     filter_coef <= 0: the raw input -> exactly zero after the flush
+//     filter_coef  > 0: a SCALAR one-pole's output, which converges to a
+//                       single value written to every position -> a CONSTANT
+//                       ring, whose rotation is a no-op
+// and freezing is bit-identical either way.
+//
+// ---- The two windows, in SERIES ----------------------------------------
+//   (a) The state has to have settled.  For filter_coef > 0 the write-path
+//       one-pole decays by filter_coef per sample, i.e. ln(r)/ln(filter_coef)
+//       samples to reach r.  filter_coef < 0 is an output-side 2-tap FIR with
+//       no state of its own.
+//   (b) EVERY entry of the L-sample ring has to have been rewritten while the
+//       state was already settled -- and an entry written at the start of the
+//       silence is not overwritten until L samples later.  So the ring-flush
+//       window runs AFTER the settling window: L + decay, not max(L, decay).
+//       This L term is what makes freezing safe at all; without it a long
+//       delay would freeze with the ring still full of audio that had simply
+//       not come round yet.
+// +1 block of margin, and ceil() on the block conversion.
+static uint32_t echo_tail_blocks(uint32_t max_delay_samples,
+                                 float feedback, float filter_coef) {
+    // Any feedback at all: never skip (see above).
+    if (feedback != 0.f) return UINT32_MAX;
+    float decay_samples = 0.f;
+    if (filter_coef > 0.f && filter_coef < 1.f)
+        decay_samples = logf(AMY_ECHO_TAIL_RESIDUE) / logf(filter_coef);
+    float blocks = ceilf(((float)max_delay_samples + decay_samples) / (float)AMY_BLOCK_SIZE) + 1.f;
+    if (!(blocks > 0.f)) return 1;                      // NaN / negative guard
+    if (blocks > (float)(UINT32_MAX / 2)) return UINT32_MAX / 2;
+    return (uint32_t)blocks;
+}
+
 void config_echo(uint8_t bus, float level, float delay_ms, float max_delay_ms, float feedback, float filter_coef) {
     if (AMY_IS_UNSET(level)) level = S2F(amy_global.bus[bus]->echo.level);
     if (AMY_IS_UNSET(delay_ms)) delay_ms = (amy_global.bus[bus]->echo.delay_samples + 0.5f) / (AMY_SAMPLE_RATE / 1000.f);
@@ -344,6 +417,14 @@ void config_echo(uint8_t bus, float level, float delay_ms, float max_delay_ms, f
     // FIR filter potentially has gain > 1 for high frequencies, so discount the loop feedback to stop things exploding.
     if (filter_coef < 0)  feedback /= 1.f - filter_coef;
     amy_global.bus[bus]->echo.feedback = F2S(feedback);
+    // Recompute the silence countdown from the POST-clamp values (the clamps
+    // above are what actually bound the loop gain), and re-arm it: any change
+    // to delay/feedback/filter/max_delay while the line is frozen mid-skip
+    // must resume the echo immediately rather than trust a stale countdown.
+    amy_global.bus[bus]->echo.tail_blocks_reload =
+        echo_tail_blocks(amy_global.bus[bus]->echo.max_delay_samples,
+                         feedback, filter_coef);
+    amy_global.bus[bus]->echo.tail_blocks = amy_global.bus[bus]->echo.tail_blocks_reload;
     //fprintf(stderr, "config_echo: delay_samples=%d level=%.3f feedback=%.3f filter_coef=%.3f fc0=%.3f\n", delay_samples, level, feedback, filter_coef, S2F(echo.filter_coef));
 }
 
@@ -437,6 +518,10 @@ void config_chorus(uint8_t bus, float level, uint16_t max_delay, float lfo_freq,
         // apply depth, lfo_freq
         synth[CHORUS_MOD_SOURCE + bus]->amp_coefs[COEF_CONST] = depth;
         synth[CHORUS_MOD_SOURCE + bus]->logfreq_coefs[COEF_CONST] = logfreq_of_freq(lfo_freq);
+        // Re-arm the silence countdown: a max_delay / lfo_freq / depth change
+        // moves the read tap, so a chorus parked mid-skip must resume at once
+        // instead of trusting a countdown taken under the old settings.
+        amy_global.bus[bus]->chorus.tail_blocks = AMY_CHORUS_TAIL_BLOCKS;
     } else if (old_level > 0) {
         // >0 -> 0: remember when the lines froze.
         amy_global.bus[bus]->chorus.disabled_at_block = amy_global.total_blocks;
@@ -2371,13 +2456,23 @@ int16_t * amy_fill_buffer() {
     for (int bus=0; bus <= amy_global.highest_bus; ++bus) {
         uint32_t bit = 1u << bus;
         eq_state_t *beq = &amy_global.bus[bus]->eq;
+        chorus_config_t *bch = &amy_global.bus[bus]->chorus;
+        echo_config_t *bec = &amy_global.bus[bus]->echo;
         uint8_t eq_on = (beq->eq[0] != F2S(1.0f) || beq->eq[1] != F2S(1.0f) || beq->eq[2] != F2S(1.0f));
-        uint8_t run_eq = 0;        // run the EQ over this bus this block
+        // The old unconditional apply guards, hoisted: "this effect is
+        // configured on and has its state allocated".
+        uint8_t chorus_on = AMY_HAS_CHORUS && bch->level > 0 && bch->chorus_delay_lines[0] != NULL;
+        uint8_t echo_on = AMY_HAS_ECHO && bec->level > 0 && bec->echo_delay_lines[0] != NULL;
+        uint8_t run_eq = 0;                  // run the EQ over this bus this block
+        uint8_t run_chorus = chorus_on;      // ... and the chorus
+        uint8_t run_echo = echo_on;          // ... and the echo
         if (bus_live & bit) {
             // Oscs sounded on this bus: run the EQ (if non-unity) and
-            // re-arm its silence countdown.
+            // re-arm every effect's silence countdown.
             run_eq = eq_on;
             if (eq_on) beq->tail_blocks = AMY_EQ_TAIL_BLOCKS;
+            if (chorus_on) bch->tail_blocks = AMY_CHORUS_TAIL_BLOCKS;
+            if (echo_on) bec->tail_blocks = bec->tail_blocks_reload;
         } else {
             // No oscs played this bus. FX with STATE (chorus/echo delay
             // lines, EQ biquads, per-bus reverb) still carry an audible
@@ -2395,10 +2490,42 @@ int16_t * amy_fill_buffer() {
             // then counts as active FX on every silent block (countdown
             // ignored), i.e. the pre-skip behavior of filtering zero blocks
             // forever.
+            // The CHORUS and ECHO get the same treatment, with their own
+            // countdowns (AMY_CHORUS_TAIL_BLOCKS / echo_tail_blocks()). Both
+            // are delay lines whose read tap is RELATIVE to the write index,
+            // so once the ring has settled into something further running
+            // would only reproduce -- all zeros for the chorus (it is a pure
+            // FIR of its input, feedback_level is hardwired 0), all zeros or
+            // one constant for a feedback-free echo -- freezing the write
+            // index is a pure relabeling and resuming is bit-identical.
+            // (echo_tail_blocks() refuses to skip an echo WITH feedback: in
+            // this fixed-point implementation that loop never settles.)
+            // Chorus is the expensive one: ~130-153 us per bus per block on
+            // the S3, 2.2-2.6% of the 5805 us budget EACH, and 62 of the
+            // deck's 127 built-in patches bake chorus level=1.
+            //
+            // The three countdowns CASCADE, because on a silent block the
+            // effects are not each seeing zeros -- they are seeing whatever
+            // the stage above them still emits. So an effect's countdown is
+            // held at full while anything upstream of it in this same chain
+            // (EQ -> chorus -> echo) is still running, and only starts to run
+            // down once its input is genuinely all zeros. Without this the
+            // chorus would freeze with the EQ's (tiny but nonzero) zero-input
+            // tail still in its ring, and the echo would freeze with up to
+            // DELAY_LINE_LEN samples of real audio from the chorus tail still
+            // in its ring -- neither of which is bit-identical.
             uint8_t eq_tail = eq_on && (beq->tail_blocks > 0 || !amy_eq_silent_skip);
-            uint8_t fx_active = eq_tail
-                || (AMY_HAS_CHORUS && amy_global.bus[bus]->chorus.level > 0 && amy_global.bus[bus]->chorus.chorus_delay_lines[0] != NULL)
-                || (AMY_HAS_ECHO && amy_global.bus[bus]->echo.level > 0 && amy_global.bus[bus]->echo.echo_delay_lines[0] != NULL)
+            if (eq_tail && chorus_on) bch->tail_blocks = AMY_CHORUS_TAIL_BLOCKS;
+            uint8_t chorus_tail = chorus_on && (bch->tail_blocks > 0 || !amy_chorus_silent_skip);
+            if ((eq_tail || chorus_tail) && echo_on) bec->tail_blocks = bec->tail_blocks_reload;
+            uint8_t echo_tail = echo_on && (bec->tail_blocks > 0 || !amy_echo_silent_skip);
+            run_chorus = chorus_tail;
+            run_echo = echo_tail;
+#ifdef AMY_FX_SKIP_PROBE
+            if (chorus_on && !chorus_tail) amy_chorus_blocks_skipped++;
+            if (echo_on && !echo_tail) amy_echo_blocks_skipped++;
+#endif
+            uint8_t fx_active = eq_tail || chorus_tail || echo_tail
 #if !defined(AMY_MASTER_REVERB) && !defined(AMY_AUX_REVERB)
                 || (AMY_HAS_REVERB && amy_global.bus[bus]->reverb.level > 0 && amy_global.bus[bus]->reverb.rev != NULL)
 #endif
@@ -2411,14 +2538,24 @@ int16_t * amy_fill_buffer() {
                 // (guarded: with the skip disabled eq_tail can be true at 0)
                 if (beq->tail_blocks > 0) beq->tail_blocks--;
             }
+            // (same guard: with the skip disabled the tail flag is true at 0)
+            if (chorus_tail && bch->tail_blocks > 0) bch->tail_blocks--;
+            // UINT32_MAX reload == "this echo configuration never freezes"
+            // (feedback != 0): pin it rather than count down for seven years.
+            if (echo_tail && bec->tail_blocks > 0
+                    && bec->tail_blocks_reload != UINT32_MAX) bec->tail_blocks--;
         }
         // Per-bus EQ
         if (run_eq) {
             parametric_eq_process(bus, fbl[0][bus]);
         }
         if(AMY_HAS_CHORUS) {
-            // apply per-bus chorus.
-            if(amy_global.bus[bus]->chorus.level > 0 && amy_global.bus[bus]->chorus.chorus_delay_lines[0] != NULL) {
+            // apply per-bus chorus.  run_chorus == chorus_on except on a
+            // silent block whose countdown has expired (see above).
+            if(run_chorus) {
+#ifdef AMY_FX_SKIP_PROBE
+                amy_chorus_blocks_run++;
+#endif
                 // apply time-varying delays to both chans.
                 // delay_mod_val, the modulated delay amount, is set up before calling render_*.
                 SAMPLE scale = F2S(1.0f);
@@ -2433,7 +2570,10 @@ int16_t * amy_fill_buffer() {
         //}
         if (AMY_HAS_ECHO) {
             // Apply per-bus echo.
-            if (amy_global.bus[bus]->echo.level > 0 && amy_global.bus[bus]->echo.echo_delay_lines[0] != NULL ) {
+            if (run_echo) {
+#ifdef AMY_FX_SKIP_PROBE
+                amy_echo_blocks_run++;
+#endif
                 for (int16_t c=0; c < AMY_NCHANS; ++c) {
                     apply_fixed_delay(fbl[0][bus] + c * AMY_BLOCK_SIZE, amy_global.bus[bus]->echo.echo_delay_lines[c], amy_global.bus[bus]->echo.level, amy_global.bus[bus]->echo.feedback, amy_global.bus[bus]->echo.filter_coef);
                 }

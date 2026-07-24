@@ -294,6 +294,18 @@ extern void amy_set_gm_big_pcm_window(const int16_t * data,
 // (single byte, sampled once per bus per block by amy_fill_buffer).
 extern volatile uint8_t amy_eq_silent_skip;
 
+// Runtime A/B switches for the same idea applied to a silent bus's CHORUS and
+// ECHO (see AMY_CHORUS_TAIL_BLOCKS below and echo_config_t::tail_blocks).
+// 1 (default): skip enabled -- the effect stops running once its silence
+// countdown expires, delay line and write index frozen. 0: skip disabled --
+// the effect counts as active FX on every silent block, countdown ignored,
+// exactly the pre-skip behavior of running its full per-sample loop over zero
+// blocks forever. Same discipline as amy_eq_silent_skip: written from the
+// control task (REPL), sampled once per bus per block by amy_fill_buffer, so
+// either value is always sane and no atomics are needed.
+extern volatile uint8_t amy_chorus_silent_skip;
+extern volatile uint8_t amy_echo_silent_skip;
+
 // reverb setup
 #define REVERB_DEFAULT_LEVEL 0
 #define REVERB_DEFAULT_LIVENESS 0.85f
@@ -316,6 +328,44 @@ extern volatile uint8_t amy_eq_silent_skip;
 #define AMY_SEQUENCER_PPQ 48
 
 #define DELAY_LINE_LEN 512  // 11 ms @ 44 kHz
+
+// How many blocks to keep running a bus's CHORUS after its input goes silent,
+// before skipping it (delay line + write index frozen) until the bus sounds
+// again.  Closed form, not a measurement:
+//   * The chorus is a pure FIR ring.  amy_fill_buffer calls
+//     apply_variable_delay(..., chorus.level, /*feedback_level=*/0), and in
+//     delay_line_in_out() the write is next_in = *in + MUL8_SS(0, ...);
+//     MUL8_SS(0, x) == ((0 >> 12) * (x >> 11)) >> 0 == 0 exactly, so the line
+//     stores raw input with no recursion -- nothing to decay, only to flush.
+//   * The read tap can reach ANY entry: index_bits = log2(DELAY_LINE_LEN) = 9
+//     and the modulated subtrahend spans up to one whole phasor, i.e. the full
+//     DELAY_LINE_LEN.  So the line is only safe to freeze once EVERY entry has
+//     been rewritten with zero, which takes DELAY_LINE_LEN samples.
+// Hence ceil(DELAY_LINE_LEN / AMY_BLOCK_SIZE) blocks, +1 block of margin.
+// The read tap is RELATIVE to next_in, so freezing next_in is a pure
+// relabeling of an all-zero ring: the first block after a resume is
+// BIT-IDENTICAL to never having skipped (verified on the host A/B harness).
+// NOTE: the chorus LFO (the CHORUS_MOD_SOURCE osc rendered into
+// chorus.delay_mod) is deliberately NOT gated -- it must keep running so the
+// LFO phase on resume matches what it would have been, and a frozen LFO
+// resuming at the wrong phase is an audible artifact.  Gating it too would
+// need a phase fast-forward; that is a possible future item.
+#define AMY_CHORUS_TAIL_BLOCKS \
+    (((DELAY_LINE_LEN + AMY_BLOCK_SIZE - 1) / AMY_BLOCK_SIZE) + 1)
+
+// Echo's countdown is per-configuration, not a constant -- see
+// echo_tail_blocks() in amy.c and echo_config_t::tail_blocks_reload.
+// AMY_ECHO_TAIL_RESIDUE is how far the echo's state must have rung down before
+// the ring-flush window starts.  It is NOT "quiet enough to ignore": it is set
+// below the point where the state stops changing at all, so that the flush
+// that follows leaves the line in a state further running could only
+// reproduce, which is what makes freezing BIT-IDENTICAL rather than merely
+// inaudible.  1e-6 of unity full scale is 8 counts of s8.23; the fixed-point
+// multiply SMULR6 quantizes its operand in steps of 2048 counts, so a state
+// that small is already at its final value.  The cost of the margin is only
+// more silent blocks before the skip engages, on a bus that is by definition
+// idle.
+#define AMY_ECHO_TAIL_RESIDUE 1e-6f
 
 // D is how close the sample gets to the clip limit before the nonlinearity engages.  
 // So D=0.1 means output is linear for -0.9..0.9, then starts clipping.
@@ -984,6 +1034,13 @@ typedef struct chorus_config {
     float depth;
     delay_line_t *chorus_delay_lines[AMY_MAX_CHANNELS];
     SAMPLE *delay_mod;
+    // Silence countdown, exactly like eq_state_t::tail_blocks: re-armed to
+    // AMY_CHORUS_TAIL_BLOCKS every block this bus has audible oscs (and every
+    // block an upstream stage is still emitting its own tail into the block),
+    // decremented on blocks whose input is known to be all zero. At 0 the
+    // chorus is skipped with its delay line frozen. Written by amy_fill_buffer
+    // (fill task) and by config_chorus.
+    uint8_t tail_blocks;
 } chorus_config_t;
 
 typedef struct echo_config {
@@ -994,6 +1051,15 @@ typedef struct echo_config {
     SAMPLE feedback;  // Gain applied when feeding back output to input.
     SAMPLE filter_coef;  // Echo is filtered by a two-point normalize IIR.  This is the real pole location.
     delay_line_t *echo_delay_lines[AMY_MAX_CHANNELS];
+    // Silence countdown, same role as chorus_config_t::tail_blocks, but the
+    // reload is a function of the current delay/max_delay/filter settings
+    // (echo_tail_blocks() in amy.c) rather than a compile-time constant, and
+    // uint32_t because the reload doubles as the sentinel UINT32_MAX, meaning
+    // "this configuration never freezes" (any nonzero feedback -- see
+    // echo_tail_blocks). Recomputed by config_echo AFTER the feedback clamp,
+    // so it always reflects the values the render loop actually uses.
+    uint32_t tail_blocks;
+    uint32_t tail_blocks_reload;
 } echo_config_t;
 
 
