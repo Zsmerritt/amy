@@ -731,6 +731,9 @@ SAMPLE render_envelope(SAMPLE *buf, uint16_t osc) {
 
 void partial_note_on(uint16_t osc) {
     synth[osc]->lut = NULL;
+    // interp_partials/BYO rewrite this osc's bp0 arrays just before calling
+    // here, so any cached sustain value in compute_breakpoint_scale() is stale.
+    for (uint8_t j = 0; j < MAX_BREAKPOINT_SETS; ++j)  synth[osc]->bp_frozen[j] = 0;
 }
 
 void _partial_note_on(uint16_t osc, float freq) {

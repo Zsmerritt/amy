@@ -53,6 +53,27 @@ AMY_IRAM_ATTR SAMPLE compute_mod1_scale(uint16_t osc) {
 // sample_offset allows you to probe the EG output at some point this many samples into the future.
 AMY_IRAM_ATTR SAMPLE compute_breakpoint_scale(uint16_t osc, uint8_t bp_set, uint16_t sample_offset) {
     AMY_PROFILE_START(COMPUTE_BREAKPOINT_SCALE)
+    // Freeze fast path.  If this bp_set has already run past every defined
+    // segment for *this* note_on_clock, it is parked in sustain and returns the
+    // constant last_scale[bp_set] until note-off or retrigger.  Skipping the
+    // scan is exact because (a) `elapsed` is monotonic non-decreasing while
+    // note_on_clock is unchanged (total_blocks only counts up, sample_offset is
+    // 0 or +AMY_BLOCK_SIZE, and the offset-0 probe of block N+1 lands exactly on
+    // the offset-BLOCK probe of block N), so the "no segment contains elapsed"
+    // test can never become true again, and (b) the sustain value depends only
+    // on breakpoint_times/values, every write to which clears bp_frozen.
+    if (synth[osc]->bp_frozen[bp_set]) {
+        uint32_t now_samples = amy_global.total_blocks * AMY_BLOCK_SIZE;
+        if (synth[osc]->note_on_clock == synth[osc]->bp_frozen_note_on_clock[bp_set]
+            && now_samples >= synth[osc]->note_on_clock) {
+            AMY_PROFILE_STOP(COMPUTE_BREAKPOINT_SCALE)
+            return synth[osc]->last_scale[bp_set];
+        }
+        // Either the key changed (note-off / retrigger) or the sysclock was
+        // rewound under us (amy_reset_sysclock()) so `elapsed` is no longer
+        // monotonic.  Drop the freeze and take the full scan below.
+        synth[osc]->bp_frozen[bp_set] = 0;
+    }
     // given a breakpoint list, compute the scale
     // we first see how many BPs are defined, and where we are in them?
     int8_t found = -1;
@@ -110,6 +131,14 @@ AMY_IRAM_ATTR SAMPLE compute_breakpoint_scale(uint16_t osc, uint8_t bp_set, uint
             found = bp_r - 1; // segment before release defines sustain
             scale = F2S(synth[osc]->breakpoint_values[bp_set][found]);
             synth[osc]->last_scale[bp_set] = scale;
+            // Park in sustain: every later call with this note_on_clock lands
+            // here again with the same value, so serve it from last_scale.
+            // Only arm the freeze if `elapsed` was computed without unsigned
+            // underflow (i.e. the clock has not been rewound past note-on).
+            if (amy_global.total_blocks * AMY_BLOCK_SIZE >= synth[osc]->note_on_clock) {
+                synth[osc]->bp_frozen[bp_set] = 1;
+                synth[osc]->bp_frozen_note_on_clock[bp_set] = synth[osc]->note_on_clock;
+            }
             //printf("env: time %lld bpset %d seg %d SUSTAIN %f\n", amy_global.total_blocks*AMY_BLOCK_SIZE, bp_set, found, S2F(scale));
             //return scale;
             goto return_label;
