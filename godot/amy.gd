@@ -43,6 +43,8 @@ const FILTER_LPF: int = 1
 const FILTER_BPF: int = 2
 const FILTER_HPF: int = 3
 const FILTER_LPF24: int = 4
+const FILTER_NOTCH: int = 5
+const FILTER_PHASER: int = 6
 
 # ============================================================
 #  Envelope types
@@ -269,6 +271,7 @@ func _format_ctrl(val: Variant) -> String:
 # ============================================================
 # BEGIN GENERATED - scripts/gen_amy_gd_api.py
 var _KW_MAP: Dictionary = {
+	"ticks":               ["H", "L"],
 	"osc":                 ["v", "I"],
 	"wave":                ["w", "I"],
 	"note":                ["n", "F"],
@@ -277,7 +280,6 @@ var _KW_MAP: Dictionary = {
 	"freq":                ["f", "C"],
 	"duty":                ["d", "C"],
 	"feedback":            ["b", "F"],
-	"time":                ["t", "I"],
 	"reset":               ["S", "I"],
 	"phase":               ["P", "F"],
 	"pan":                 ["Q", "C"],
@@ -295,8 +297,6 @@ var _KW_MAP: Dictionary = {
 	"debug":               ["D", "I"],
 	"chained_osc":         ["c", "I"],
 	"mod_source":          ["L", "I"],
-	"mod1_source":         ["J", "I"],
-	"sync_source":         ["Y", "I"],
 	"eq":                  ["x", "L"],
 	"filter_type":         ["G", "I"],
 	"ratio":               ["I", "F"],
@@ -308,13 +308,10 @@ var _KW_MAP: Dictionary = {
 	"algorithm":           ["o", "I"],
 	"chorus":              ["k", "L"],
 	"reverb":              ["h", "L"],
-	"reverb_send":         ["q", "F"],
 	"echo":                ["M", "L"],
 	"patch":               ["K", "I"],
-	"voices":              ["r", "L"],
 	"external_channel":    ["W", "I"],
 	"portamento":          ["m", "I"],
-	"sequence":            ["H", "L"],
 	"tempo":               ["j", "F"],
 	"sequencer_run":       ["zY", "I"],
 	"external_midi_sync":  ["zC", "I"],
@@ -328,12 +325,12 @@ var _KW_MAP: Dictionary = {
 	"grab_midi_notes":     ["im", "I"],
 	"note_source_channel": ["iM", "I"],
 	"synth_delay":         ["id", "I"],
-	"mpe":                 ["iE", "L"],
 	"preset":              ["p", "I"],
 	"num_partials":        ["p", "I"],
 	"start_sample":        ["zS", "L"],
 	"stop_sample":         ["zO", "I"],
 	"bus":                 ["y", "I"],
+	"mode":                ["ww", "I"],
 	"midi_cc":             ["ic", "L"],
 	"midi_note_cmd":       ["io", "L"],
 	"cv_trigger":          ["ig", "L"],
@@ -341,15 +338,15 @@ var _KW_MAP: Dictionary = {
 }
 
 var _KW_PRIORITY: Dictionary = {
-	"osc": 0,
-	"wave": 1,
-	"note": 2,
-	"vel": 3,
-	"amp": 4,
-	"freq": 5,
-	"duty": 6,
-	"feedback": 7,
-	"time": 8,
+	"ticks": 0,
+	"osc": 1,
+	"wave": 2,
+	"note": 3,
+	"vel": 4,
+	"amp": 5,
+	"freq": 6,
+	"duty": 7,
+	"feedback": 8,
 	"reset": 9,
 	"phase": 10,
 	"pan": 11,
@@ -367,48 +364,97 @@ var _KW_PRIORITY: Dictionary = {
 	"debug": 23,
 	"chained_osc": 24,
 	"mod_source": 25,
-	"mod1_source": 26,
-	"sync_source": 27,
-	"eq": 28,
-	"filter_type": 29,
-	"ratio": 30,
-	"latency_ms": 31,
-	"algo_source": 32,
-	"load_sample": 33,
-	"transfer_file": 34,
-	"disk_sample": 35,
-	"algorithm": 36,
-	"chorus": 37,
-	"reverb": 38,
-	"reverb_send": 39,
-	"echo": 40,
-	"patch": 41,
-	"voices": 42,
-	"external_channel": 43,
-	"portamento": 44,
-	"sequence": 45,
-	"tempo": 46,
-	"sequencer_run": 47,
-	"external_midi_sync": 48,
-	"synth": 49,
-	"pedal": 50,
-	"synth_flags": 51,
-	"num_voices": 52,
-	"oscs_per_voice": 53,
-	"synth_level": 54,
-	"to_synth": 55,
-	"grab_midi_notes": 56,
-	"note_source_channel": 57,
-	"synth_delay": 58,
-	"mpe": 59,
-	"preset": 60,
-	"num_partials": 61,
-	"start_sample": 62,
-	"stop_sample": 63,
-	"bus": 64,
-	"midi_cc": 65,
-	"midi_note_cmd": 66,
-	"cv_trigger": 67,
-	"patch_string": 68,
+	"eq": 26,
+	"filter_type": 27,
+	"ratio": 28,
+	"latency_ms": 29,
+	"algo_source": 30,
+	"load_sample": 31,
+	"transfer_file": 32,
+	"disk_sample": 33,
+	"algorithm": 34,
+	"chorus": 35,
+	"reverb": 36,
+	"echo": 37,
+	"patch": 38,
+	"external_channel": 39,
+	"portamento": 40,
+	"tempo": 41,
+	"sequencer_run": 42,
+	"external_midi_sync": 43,
+	"synth": 44,
+	"pedal": 45,
+	"synth_flags": 46,
+	"num_voices": 47,
+	"oscs_per_voice": 48,
+	"synth_level": 49,
+	"to_synth": 50,
+	"grab_midi_notes": 51,
+	"note_source_channel": 52,
+	"synth_delay": 53,
+	"preset": 54,
+	"num_partials": 55,
+	"start_sample": 56,
+	"stop_sample": 57,
+	"bus": 58,
+	"mode": 59,
+	"midi_cc": 60,
+	"midi_note_cmd": 61,
+	"cv_trigger": 62,
+	"patch_string": 63,
 }
 # END GENERATED
+
+# ============================================================
+#  Table-driven C API (native + web). Regenerate: make c-api
+# ============================================================
+# BEGIN GENERATED C API - scripts/gen_amy_c_api.py
+## Reset the AMY millisecond clock to zero
+func reset_sysclock() -> void:
+	if _is_web:
+		JavaScriptBridge.eval("amy_c_api && amy_c_api.reset_sysclock()")
+	elif _synth:
+		_synth.call("reset_sysclock")
+
+## Smoothed fraction of real time AMY spends rendering (0..1)
+func render_load() -> float:
+	if _is_web:
+		var v: Variant = JavaScriptBridge.eval("amy_c_api ? amy_c_api.render_load() : null", true)
+		return 0.0 if v == null else float(v)
+	if _synth:
+		return _synth.call("render_load")
+	return 0.0
+
+## Set the render-load fraction that trips the overload failsafe (0 disables)
+func set_render_load_threshold(threshold: float) -> void:
+	if _is_web:
+		JavaScriptBridge.eval("amy_c_api && amy_c_api.set_render_load_threshold(%s)" % [str(threshold)])
+	elif _synth:
+		_synth.call("set_render_load_threshold", threshold)
+
+## Play the startup bleep
+func bleep(start: int = 0) -> void:
+	if _is_web:
+		JavaScriptBridge.eval("amy_c_api && amy_c_api.bleep(%s)" % [str(start)])
+	elif _synth:
+		_synth.call("bleep", start)
+
+## Read the sequencer tick count
+func sequencer_ticks() -> int:
+	if _is_web:
+		var v: Variant = JavaScriptBridge.eval("amy_c_api ? amy_c_api.sequencer_ticks() : null", true)
+		return 0 if v == null else int(v)
+	if _synth:
+		return _synth.call("sequencer_ticks")
+	return 0
+
+## Read the complete replayable AMY state as a wire-command string
+func dump_state() -> String:
+	if _is_web:
+		var v: Variant = JavaScriptBridge.eval("amy_c_api ? amy_c_api.dump_state() : null", true)
+		return "" if v == null else String(v)
+	if _synth:
+		return _synth.call("dump_state")
+	return ""
+
+# END GENERATED C API

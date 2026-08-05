@@ -117,8 +117,8 @@ const LUT *choose_from_lutset(float period, const LUT *lutset) {
 
 #define NOTHING ;
 
-
-AMY_IRAM_ATTR PHASOR render_lut_fm_fb(SAMPLE* buf,
+/* is this in fact ever used? */
+PHASOR render_lut_fm_fb(SAMPLE* buf,
                         PHASOR phase, 
                         PHASOR step,
                         SAMPLE incoming_amp, SAMPLE ending_amp,
@@ -206,6 +206,45 @@ AMY_IRAM_ATTR PHASOR render_lut(SAMPLE* buf,
      }
     *pmax_value = max_value;
     AMY_PROFILE_STOP(RENDER_LUT)
+    return phase;
+}
+
+// Highly optimized for 256 pt sine table
+AMY_IRAM_ATTR PHASOR render_lut_256(SAMPLE* buf,
+                  PHASOR phase,
+                  PHASOR step,
+                  SAMPLE incoming_amp, SAMPLE ending_amp,
+                  const LUT* lut,
+                  SAMPLE* pmax_value) {
+    // RENDER_LUT_PREAMBLE
+    //int lut_mask = 255;
+    //int lut_bits = 8;
+    SAMPLE sample = 0;
+    SAMPLE max_value = 0;
+    SAMPLE current_amp = incoming_amp;
+    SAMPLE incremental_amp = SHIFTR(ending_amp - incoming_amp, BLOCK_SIZE_BITS);
+    phase = SHIFTL(phase, 1);  // Make phase into _32 instead of s_31
+    step = SHIFTL(step, 1);
+    for(uint16_t i = 0; i < AMY_BLOCK_SIZE; i++) {
+        //int16_t base_index = INT_OF_P(phase, lut_bits);
+        //int16_t base_index = (int32_t)((((uint32_t)(phase << 1)) >> (P_FRAC_BITS + 1 - lut_bits)));
+        int16_t base_index = (int32_t)((((uint32_t)phase) >> 24));
+        //SAMPLE frac = S_FRAC_OF_P(phase, lut_bits);
+        SAMPLE frac = (int32_t)(((uint32_t)(phase << 8)) >> 9);
+        SAMPLE b = L2S(lut->table[base_index]);
+        //SAMPLE c = L2S(lut->table[(base_index + 1) & lut_mask]);
+        SAMPLE c = L2S(lut->table[base_index + 1]); // table has guard point at end
+        sample = b + MUL0_SS(c - b, frac);
+        SAMPLE value = buf[i] + MULA_SS(sample, current_amp);
+        buf[i] = value;
+        if (value < 0) value = -value;
+        if (value > max_value) max_value = value;
+        current_amp += incremental_amp;
+        //phase = P_WRAPPED_SUM(phase, step);
+        phase = (int32_t)((uint32_t)(((uint32_t)phase) + ((uint32_t)step)));
+    }
+    phase = SHIFTR(phase, 1);  // Restore phase to s_31
+    *pmax_value = max_value;
     return phase;
 }
 
@@ -567,9 +606,12 @@ SAMPLE render_fm_sine(SAMPLE* buf, uint16_t osc, SAMPLE* mod, SAMPLE feedback_le
                                          synth[osc]->lut,
                                          mod, &max_value);
     else
-        synth[osc]->phase = render_lut(buf, synth[osc]->phase, step,
-                                      last_amp, amp,
-                                      synth[osc]->lut, &max_value);
+        //synth[osc]->phase = render_lut(buf, synth[osc]->phase, step,
+        //                              last_amp, amp,
+        //                              synth[osc]->lut, &max_value);
+        synth[osc]->phase = render_lut_256(buf, synth[osc]->phase, step,
+                                           last_amp, amp,
+                                           /* synth[osc]->lut */ &sine_fxpt_lutset[0], &max_value);
 
     msynth[osc]->last_amp = msynth[osc]->amp;
     return max_value;
@@ -598,11 +640,13 @@ SAMPLE render_sine(SAMPLE* buf, uint16_t osc) {
     SAMPLE last_amp = F2S(msynth[osc]->last_amp);
     //fprintf(stderr, "render_sine: time %f osc %d freq %f last_amp %f amp %f\n", amy_global.total_blocks*AMY_BLOCK_SIZE / (float)AMY_SAMPLE_RATE, osc, AMY_SAMPLE_RATE * P2F(step), S2F(last_amp), S2F(amp));
     SAMPLE max_value;
+    // FORK hard-sync (4ed0cd5b): when SYNC_SOURCE is set, render the sync'd LUT.
+    // Otherwise take upstream's faster render_lut_256 sine path (PR #995 36fd40ca).
     PHASOR sync_phase, sync_step;
     if (sync_params(osc, &sync_phase, &sync_step))
         synth[osc]->phase = render_synced_lut(buf, synth[osc]->phase, step, sync_phase, sync_step, F2P(0), last_amp, amp, synth[osc]->lut, &max_value);
     else
-        synth[osc]->phase = render_lut(buf, synth[osc]->phase, step, last_amp, amp, synth[osc]->lut, &max_value);
+        synth[osc]->phase = render_lut_256(buf, synth[osc]->phase, step, last_amp, amp, /* synth[osc]->lut */ &sine_fxpt_lutset[0], &max_value);
     msynth[osc]->last_amp = msynth[osc]->amp;
     return max_value;
 }
@@ -736,22 +780,24 @@ void partial_note_on(uint16_t osc) {
     for (uint8_t j = 0; j < MAX_BREAKPOINT_SETS; ++j)  synth[osc]->bp_frozen[j] = 0;
 }
 
-void _partial_note_on(uint16_t osc, float freq) {
-    if (synth[osc]->lut == NULL) {
-        float period_samples = (float)AMY_SAMPLE_RATE / freq;
-        synth[osc]->lut = choose_from_lutset(period_samples, sine_fxpt_lutset);
-    }
-}
+//void _partial_note_on(uint16_t osc, float freq) {
+//    if (synth[osc]->lut == NULL) {
+//        float period_samples = (float)AMY_SAMPLE_RATE / freq;
+//        synth[osc]->lut = choose_from_lutset(period_samples, sine_fxpt_lutset);
+//    }
+//}
 
-SAMPLE render_partial(SAMPLE * buf, uint16_t osc) {
+AMY_IRAM_ATTR SAMPLE render_partial(SAMPLE * buf, uint16_t osc) {
     float freq = freq_of_logfreq(msynth[osc]->logfreq);
-    _partial_note_on(osc, freq);
+    //_partial_note_on(osc, freq);
+    //synth[osc]->lut = sine_fxpt_lutset[0];  // we know there's only one.
     PHASOR step = F2P(freq / (float)AMY_SAMPLE_RATE);  // cycles per sec / samples per sec -> cycles per sample
     SAMPLE amp = F2S(msynth[osc]->amp);
     SAMPLE last_amp = F2S(msynth[osc]->last_amp);
     //printf("render_partial: time %.3f logfreq %f freq %f last_amp %f amp %f step %f\n", (float)amy_global.total_blocks*AMY_BLOCK_SIZE/(float)AMY_SAMPLE_RATE, msynth[osc]->logfreq, freq, S2F(last_amp), S2F(amp), P2F(step) * synth[osc]->lut->table_size);
     SAMPLE max_value;
-    synth[osc]->phase = render_lut(buf, synth[osc]->phase, step, last_amp, amp, synth[osc]->lut, &max_value);
+    //synth[osc]->phase = render_lut(buf, synth[osc]->phase, step, last_amp, amp, /* synth[osc]->lut */ &sine_fxpt_lutset[0], &max_value);
+    synth[osc]->phase = render_lut_256(buf, synth[osc]->phase, step, last_amp, amp, /* synth[osc]->lut */ &sine_fxpt_lutset[0], &max_value);
     msynth[osc]->last_amp = msynth[osc]->amp;
     return max_value;
 }
@@ -850,53 +896,80 @@ void wavetable_note_on(uint16_t osc, float freq) {
 }
 
 // Structure of waveeditonlie wavetables.
-const int CYCLES_PER_WAVETABLE = 64;
+//const int CYCLES_PER_WAVETABLE = 64;
 const int WAVETABLE_SAMPLES_PER_CYCLE = 256;
 const int WAVETABLE_LOG2_SAMPLES_PER_CYCLE = 8;
 
+#ifdef GAMMA9001
+#define PCM_WAVETABLE_BASE 19
+#else
+#define PCM_WAVETABLE_BASE 11
+#endif
+
 SAMPLE render_wavetable(SAMPLE* buf, uint16_t osc) {
+    SAMPLE max_value = 0;
     float freq = freq_of_logfreq(msynth[osc]->logfreq);
-    PHASOR step = F2P(freq / (float)AMY_SAMPLE_RATE);  // cycles per sec / samples per sec -> cycles per sample
+    PHASOR step = F2P(freq / (float)AMY_SAMPLE_RATE);
     SAMPLE amp = F2S(msynth[osc]->amp);
     SAMPLE last_amp = F2S(msynth[osc]->last_amp);
     //fprintf(stderr, "render_wavetable: time %f osc %d freq %f last_amp %f amp %f preset %d\n", amy_global.total_blocks*AMY_BLOCK_SIZE / (float)AMY_SAMPLE_RATE, osc, AMY_SAMPLE_RATE * P2F(step), S2F(last_amp), S2F(amp), synth[osc]->preset);
+    // FORK (c32c0afd lost-peak): both sub-renders below contribute to the peak.
     SAMPLE max_value_a = 0, max_value_b = 0;
-    float interp = MAX(0, MIN(CYCLES_PER_WAVETABLE - 1, (CYCLES_PER_WAVETABLE - 1) * msynth[osc]->duty));  // Don't try to interp beyond end of table.  An N-waveform table can be interpolated from 0 to (N-1-eps).
-    int table = MIN((int)floor(interp), CYCLES_PER_WAVETABLE - 2);  // always need both this wavetable and the next one.
-    interp = interp - table;  // fractional part, normally < 1.0, but == 1.0 for very end of table.
+    // Wavetable preset: default to the fork's configured base (pcm_wavetable_base;
+    // upstream uses the fixed PCM_WAVETABLE_BASE define). Kept as the runtime var
+    // because the deck's big-bank GM window configures it.
     int wavetable_preset = AMY_IS_SET(synth[osc]->preset)
         ? (int)synth[osc]->preset
         : (int)pcm_wavetable_base;
-    int wavetable_samples_per_table = (pcm_wavetable_len > 0) ? (int)pcm_wavetable_len : 16384;
     uint32_t sample_length = 0;
-    const int16_t *wavetable_sample_ram =
+    const int16_t *wavetable_samples =
         pcm_get_sample_ram_for_preset((uint16_t)wavetable_preset, &sample_length);
-    if ((wavetable_sample_ram == NULL || sample_length < (uint32_t)wavetable_samples_per_table) &&
-        wavetable_preset != (int)pcm_wavetable_base) {
-        wavetable_sample_ram = pcm_get_sample_ram_for_preset(pcm_wavetable_base, &sample_length);
+    // FORK: fall back to the base wavetable if the requested preset is missing or
+    // too short (the big-bank GM window can point at an unpopulated slot).
+    if ((wavetable_samples == NULL || sample_length < (2 * WAVETABLE_SAMPLES_PER_CYCLE))
+        && wavetable_preset != (int)pcm_wavetable_base) {
+        wavetable_samples = pcm_get_sample_ram_for_preset(pcm_wavetable_base, &sample_length);
     }
-    if (wavetable_sample_ram == NULL || sample_length < (uint32_t)wavetable_samples_per_table) {
+    if (wavetable_samples == NULL || sample_length < (2 * WAVETABLE_SAMPLES_PER_CYCLE)) {
+        // We need at least two cycles to have something to crossfade.
         return 0;
     }
-    // Flash fence (review FW-3): wavetable presets can resolve into the
-    // memory-mapped flash partitions, and this was the one renderer that
-    // fetched through the fence window unchecked -- the exact dual-core
-    // WDT crash render_pcm guards against (pcm.c). Hold phase, emit
-    // silence while a flash write is in flight. GAMMA9001-only: the fence
-    // symbols (and the mmap'd-flash window they describe) exist only on
-    // that build -- desktop/web link everything into RAM (amy.h:118).
+    // FORK flash fence (review FW-3): a wavetable preset can resolve into the
+    // memory-mapped flash partitions, and this was the one renderer that fetched
+    // through the fence window unchecked -- the exact dual-core WDT crash
+    // render_pcm guards against (pcm.c). Hold phase, emit silence while a flash
+    // write is in flight. GAMMA9001-only: the fence symbols (and the mmap'd-flash
+    // window they describe) exist only on that build -- desktop/web link into RAM.
 #ifdef GAMMA9001
     if (amy_flash_fence
-        && (const void *)wavetable_sample_ram >= amy_flash_fence_lo
-        && (const void *)wavetable_sample_ram < amy_flash_fence_hi) {
+        && (const void *)wavetable_samples >= amy_flash_fence_lo
+        && (const void *)wavetable_samples < amy_flash_fence_hi) {
         return 0;
     }
 #endif
-    LUT wavetable_lut = {wavetable_sample_ram, WAVETABLE_SAMPLES_PER_CYCLE, WAVETABLE_LOG2_SAMPLES_PER_CYCLE, 0, 1.0f};
-    wavetable_lut.table += table * WAVETABLE_SAMPLES_PER_CYCLE;
+    // upstream wavetabler (#997 6bfdc7ea): derive the cycle count from the actual
+    // sample length so any PCM preset with >= 2 cycles is a wavetable, instead of
+    // a fixed CYCLES_PER_WAVETABLE.
+    int cycles_this_table = sample_length >> WAVETABLE_LOG2_SAMPLES_PER_CYCLE;
+    // Don't try to interp beyond end of table.  An N-waveform table can be interpolated from 0 to (N-1-eps).
+    float interp = MAX(0,
+                       MIN(cycles_this_table - 1,
+                           (cycles_this_table - 1) * msynth[osc]->duty));
+    // always need both this wavetable and the next one.
+    int cycle = MIN((int)floor(interp),
+                    cycles_this_table - 2);
+    // fractional part, normally < 1.0, but == 1.0 for very end of table.
+    interp = interp - cycle;
+    LUT wavetable_lut = {
+        wavetable_samples + cycle * WAVETABLE_SAMPLES_PER_CYCLE,
+        WAVETABLE_SAMPLES_PER_CYCLE,
+        WAVETABLE_LOG2_SAMPLES_PER_CYCLE,
+        0,  /* highest harmonic, for choosing tables in set. */
+        1.0f,  /* scale factor, for denormalizing. */
+    };
     // don't update phase in the first call to render_lut, so second call uses the same phase
-    SAMPLE interp_a = F2S(1.0f - interp);
     SAMPLE interp_b = F2S(interp);
+    SAMPLE interp_a = F2S(1.0f) - interp_b;
     // If we used last_duty, we could actually smoothly interpolate the waveshape crossfade too (except across table boundaries).
     render_lut(buf, synth[osc]->phase, step, SMULR7(last_amp, interp_a), SMULR7(amp, interp_a), &wavetable_lut, &max_value_a);
     // Point to next cycle.

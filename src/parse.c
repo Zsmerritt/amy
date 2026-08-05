@@ -4,6 +4,7 @@
 #include "amy.h"
 #include "transfer.h"  // for amy_dump_state_to_sysex, amy_dump_file_to_sysex
 #include <ctype.h>  // for isalpha().
+#include <assert.h>
 #if defined(TULIP) || defined(AMYBOARD)
 #include "py/runtime.h"
 #endif
@@ -479,6 +480,7 @@ uint16_t amy_parse_transfer_layer_message(char *message) {
         if(sm[1]==0) { // remove preset
             pcm_unload_preset(sm[0]);
         } else {
+            amy_execute_deltas();
             int16_t * ram = pcm_load(sm[0], sm[1], sm[2], 1, sm[3], sm[4], sm[5]);
             start_receiving_transfer(sm[1]*2, (uint8_t*)ram);
         }
@@ -567,6 +569,9 @@ uint16_t amy_parse_transfer_layer_message(char *message) {
             return total;
         }
     }
+    // FORK: zA control command (upstream removed in 5bd6dfc9). Kept because
+    // tulipcc's C bridge still installs amy_external_update_file_hook; remove
+    // once the tulipcc merge drops the dependency.
     else if (cmd == 'A') {
         // zA: Update sketch.py on disk with current AMY state (calls update_file_hook).
         // Takes optional filename; defaults to /user/current/sketch.py on AMYboard.
@@ -667,33 +672,39 @@ size_t yield_event_from_message(char *message, amy_event *e, size_t pos) {
     return pos;
 }
 
+// Called from amy_add_message when the first char is 'H', indicating a ticks message.
+// It claims the rest of the message as its payload -- stored as a raw
+// wire string and only parsed when it comes due -- so a schedule command
+// is only ever honored as the first command of a message.
+void handle_ticks_message(char *message) {
+    assert(message[0] == 'H');
+    uint32_t ticks[3] = {0, 0, 0};
+    int num_vals = parse_list_uint32_t(message + 1, ticks, 3, 0);
+    uint16_t schedule_len = 1 + _next_alpha(message + 1);
+    char *payload = message + schedule_len;
+    uint16_t payload_len = (uint16_t)strlen(payload);
+    char *stripped = (char *)malloc_caps(payload_len + 1, amy_global.config.ram_caps_events);
+    if (stripped == NULL) {
+        amy_oom("ticks_message");
+    } else {
+        memcpy(stripped, payload, payload_len + 1);
+        // A tag is only "given" if all 3 values were present; fewer
+        // than that (a 1- or 2-value ticks=) stores anonymously.
+        sequencer_add_wire(ticks[TICKS_TICK], ticks[TICKS_PERIOD], ticks[TICKS_TAG],
+                           num_vals >= 3, stripped);
+    }
+}
 
 // given a string return a parsed event
+//
+// Transfer payloads never reach here: amy_add_message() traps them before
+// any parsing is attempted (see the comment there), so this only ever sees
+// real wire commands.
 int amy_parse_message(char * message, amy_event *e) {
     peek_stack("parse_message");
     int length = strlen(message);
     char cmd = '\0';
     uint16_t pos = 0;
-
-    // Check if we're in a transfer block, if so, parse it and leave this loop.
-    // FILE transfers (zT, used to write files over MIDI sysex) arrive async
-    // while a sketch may also be running, so we ONLY route them to the
-    // transfer handler when the data is sysex-originated -- otherwise a
-    // sketch calling amy.send(note=36) mid-transfer would get its wire
-    // command base64-decoded as file data and corrupt the file.
-    //
-    // AUDIO transfers (amy.load_sample / load_sample_bytes) are different:
-    // Python sends every chunk synchronously in a tight loop within the same
-    // call, so no other amy.send() can interleave. They route regardless of
-    // the sysex flag (which they don't carry, since send_raw goes through
-    // the regular wire path).
-    extern bool amy_parsing_from_sysex;
-    if (amy_global.transfer_flag == AMY_TRANSFER_TYPE_AUDIO ||
-        (amy_parsing_from_sysex && amy_global.transfer_flag == AMY_TRANSFER_TYPE_FILE)) {
-        parse_transfer_message(message, length);
-        e->status = EVENT_TRANSFER_DATA;
-        return length;
-    }
 
     while(pos < length) {
         cmd = message[pos];
@@ -724,7 +735,8 @@ int amy_parse_message(char * message, amy_event *e) {
             case 'F': parse_coef_message(arg, e->filter_freq_coefs); break;
             case 'G': e->filter_type = atoi(arg); break;
             /* g used for Alles for client # */
-            case 'H': parse_list_uint32_t(arg, e->sequence, 3, 0); break;
+            // 'H' is the ticks= schedule command, it's caught in amy_add_message before this.
+            //case 'H': parse_list_uint32_t(arg, e->ticks, 3, 0); break;
             case 'h': if (AMY_HAS_REVERB) {
                 float reverb_params[4];
                 parse_list_float(arg, reverb_params, 4, AMY_UNSET_VALUE(e->reverb_level));
@@ -771,7 +783,7 @@ int amy_parse_message(char * message, amy_event *e) {
             case 'P': e->trigger_phase=atoff(arg); break;
             case 'q': e->reverb_send = atoff(arg); break;  // aux-send spike
             case 'Q': parse_coef_message(arg, e->pan_coefs); break;
-            case 'r': parse_voices(arg, e->voices); break;
+            //case 'r': parse_voices(arg, e->voices); break;  // 'r' deprecated, you basically never control a voice directly from the API.  Planning to use it for multi-amyboard.
             case 'R': e->resonance=atoff(arg); break;
             case 's': e->pitch_bend = atoff(arg); break;
             case 'S':
@@ -795,14 +807,19 @@ int amy_parse_message(char * message, amy_event *e) {
                     AMY_UNSET(e->reset_osc);
                 }
                 break;
-            /* t used for time */
-            case 't': e->time=atol(arg); break;
+            /* t no longer used (was time=) */
             case 'T': e->eg_type[0] = atoi(arg); break;
             case 'u': patches_store_patch(e, arg); pos = strlen(message) - 1; break;  // patches_store_patch processes the patch as all the rest of the message and maybe sets patch.
             /* U used by Alles for sync */
             case 'v': e->osc=((atoi(arg)) % (AMY_OSCS+1));  break; // allow osc wraparound
             case 'V': parse_list_float(arg, e->volume, AMY_NUM_BUSES, AMY_UNSET_VALUE(e->volume[0])); break;
-            case 'w': e->wave=atoi(arg); break;
+            case 'w': if (arg[0] == 'w') {  // 'ww' is wave submode.
+                    e->mode=atoi(arg + 1);
+                    ++pos;
+                } else {
+                    e->wave=atoi(arg);
+                }
+                break;
             /* W used by Tulip for CV, external_channel */
             case 'X': e->eg_type[1] = atoi(arg); break;
             case 'x': {

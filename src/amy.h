@@ -434,6 +434,8 @@ enum coefs{
 #define FILTER_BPF 2
 #define FILTER_HPF 3
 #define FILTER_LPF24 4
+#define FILTER_NOTCH 5
+#define FILTER_PHASER 6
 // synth[].wave values
 #define SINE 0
 #define PULSE 1
@@ -459,6 +461,13 @@ enum coefs{
 #define SILENT 20  // A control osc for applying filte and env without contributing waveform
 #define CUSTOM 21
 #define WAVE_OFF 22
+// wave mode values, depend on wave type
+#define MODE_NONE 0
+#define PCM_PLAY_STOP 0
+#define PCM_PLAY 1
+#define PCM_LOOP 2
+#define PCM_LOOP_STOP 3
+#define PCM_LOOP_FOREVER 4
 
 #define AMY_WAVE_IS_PCM(w) ((w) == PCM || (w) == PCM_LEFT || (w) == PCM_RIGHT)
 
@@ -466,14 +475,11 @@ enum coefs{
 #define SYNTH_OFF 0
 #define SYNTH_AUDIBLE 1
 #define SYNTH_INAUDIBLE 2
-#define SYNTH_IS_MOD_SOURCE 3
-#define SYNTH_IS_ALGO_SOURCE 4
-
-// event.status values
-#define EVENT_EMPTY 0
-#define EVENT_SCHEDULED 1
-#define EVENT_TRANSFER_DATA 2
-#define EVENT_SEQUENCE 3
+// synth[].role values
+#define SYNTH_IS_NORMAL 0
+#define SYNTH_IS_MOD_SOURCE 1
+#define SYNTH_IS_ALGO_SOURCE 2
+#define SYNTH_IS_CHAINED 3
 
 // Envelope generator types (for synth[osc].env_type[eg]).
 #define ENVELOPE_NORMAL 0
@@ -481,10 +487,10 @@ enum coefs{
 #define ENVELOPE_DX7 2
 #define ENVELOPE_TRUE_EXPONENTIAL 3
 
-// Sequence enum
-#define SEQUENCE_TICK 0
-#define SEQUENCE_PERIOD 1
-#define SEQUENCE_TAG 2
+// Ticks enum
+#define TICKS_TICK 0
+#define TICKS_PERIOD 1
+#define TICKS_TAG 2
 
 // Reset masks
 #define RESET_SEQUENCER 4096
@@ -569,6 +575,7 @@ enum params{
     VOLUME_END=VOLUME_BASE + AMY_NUM_BUSES, // 74
     SYNC_SOURCE, MOD1_SOURCE,            // 75, 76
     REVERB_SEND,                         // 77 (aux-send spike)
+    MODE=99,                             // 99 (upstream: PCM mode param)
     ALGO_SOURCE_START=100,               // 100..105
     ALGO_SOURCE_END=100+MAX_ALGO_OPS,    // 106
     BP_START=ALGO_SOURCE_END + 1,        // 107..202
@@ -716,6 +723,7 @@ typedef struct amy_event {
     uint32_t time;  // event only
     uint16_t osc;
     uint16_t wave;
+    uint16_t mode;   // sub-mode within wave
     int16_t preset;  // Negative preset is voice count for build-your-own PARTIALS
     float midi_note;
     uint16_t patch_number;  // event only
@@ -747,7 +755,6 @@ typedef struct amy_event {
     uint16_t bp_is_set[MAX_BREAKPOINT_SETS];
     // Convert these two at least to vectors of ints, save several hundred bytes
     int16_t algo_source[MAX_ALGO_OPS];
-    uint16_t voices[MAX_VOICES_PER_INSTRUMENT];
     uint32_t eg0_times[MAX_BPS];
     float eg0_values[MAX_BPS];
     uint32_t eg1_times[MAX_BPS];
@@ -766,9 +773,8 @@ typedef struct amy_event {
     uint16_t num_voices;
     uint8_t oscs_per_voice;  // Used when initializing a synth without a patch.
     //
-    uint32_t sequence[3]; // tick, period, tag
+    uint32_t ticks[3]; // tick, period, tag
     //
-    uint8_t status;
     uint8_t note_source_channel;  // .. to mark the channel of events that come from MIDI so we don't send them back out again.
     uint32_t reset_osc;
     // Global effects
@@ -794,8 +800,9 @@ struct synthinfo {
     // Configuration (can be fixed during oscillation)
     uint8_t bus;  // Which bus this osc ends up on
     uint16_t wave;
+    uint16_t mode;   // sub-mode within wave
     int16_t preset;  // Negative preset is voice count for build-your-own PARTIALS
-    uint8_t note_source_channel;  // Was the most recent note on/off received from a MIDI channel?
+    uint8_t s_note_source_channel;  // Was the most recent note on/off received from a MIDI channel?
     float midi_note;
     float velocity;
     float amp_coefs[NUM_COMBO_COEFS];
@@ -824,6 +831,7 @@ struct synthinfo {
     const LUT *lut;       // Selected lookup table and size.
     // Per-block state (changes with time)
     uint8_t status;  // not in event
+    uint8_t role;  // not in event
     PHASOR phase;  // not in event
     float step;  // not in event
     float substep;  // not in event
@@ -866,16 +874,8 @@ struct mod_synthinfo {
     float last_filter_logfreq;  // filter freq history for smoothing.
     float resonance;
     float feedback;
+    uint16_t state;    // Used for PCM looping state.
 };
-
-
-typedef struct sequence_entry_ll_t {
-    struct delta d;
-    uint32_t tag;
-    uint32_t tick; // 0 means not used 
-    uint32_t period; // 0 means not used 
-    struct sequence_entry_ll_t *next;
-} sequence_entry_ll_t;
 
 
 typedef struct delay_line {
@@ -957,6 +957,11 @@ typedef struct  {
     float (*amy_external_coef_hook)(uint16_t channel);
     void (*amy_external_block_done_hook)(void);
     void (*amy_external_midi_input_hook)(uint8_t *bytes, uint16_t len, uint8_t is_sysex);
+    // Called with every run of bytes AMY sends out over MIDI, before (and
+    // regardless of) any device interface configured in `midi`, so hosts can
+    // forward AMY's MIDI output to transports AMY doesn't drive itself (e.g.
+    // BLE MIDI).  May be called from the render/sequencer task; keep it fast.
+    void (*amy_external_midi_output_hook)(uint8_t *bytes, uint16_t len);
     void (*amy_external_sequencer_hook)(uint32_t tick_count);
     uint32_t (*amy_external_fopen_hook)(char *filename, const char *mode);
     uint32_t (*amy_external_fwrite_hook)(uint32_t fptr, uint8_t *bytes, uint32_t len);
@@ -964,7 +969,7 @@ typedef struct  {
     void (*amy_external_fseek_hook)(uint32_t fptr, uint32_t pos);
     void (*amy_external_fclose_hook)(uint32_t fptr);
     void (*amy_external_file_transfer_done_hook)(const char *filename);
-    void (*amy_external_update_file_hook)(const char *filename);
+    void (*amy_external_update_file_hook)(const char *filename);  // FORK: zA support; tulipcc C depends on this until the tulipcc merge lands (upstream removed in 5bd6dfc9)
     void (*amy_external_exec_hook)(const char *code);
     void (*amy_external_reboot_hook)(uint8_t mode);
     // Called (from the render task -- set a flag and return quickly) when the
@@ -1115,7 +1120,6 @@ typedef struct global_state {
     uint32_t sequencer_tick_count;
     uint64_t next_amy_tick_us;
     uint32_t us_per_tick;
-    sequence_entry_ll_t * sequence_entry_ll_start;
 
     // Buses
     bus_state_t *bus[AMY_NUM_BUSES];
@@ -1129,6 +1133,9 @@ typedef struct global_state {
     // Precomputed overload thresholds
     uint32_t overload_threshold_us;
     uint16_t overload_blocks;
+
+    // Runtime allocation failures since amy_start (see amy_oom).
+    uint32_t oom_count;
 } global_state_t;
 
 
@@ -1177,6 +1184,7 @@ uint16_t alpha_to_portamento_ms(float alpha);
 int8_t check_init(amy_err_t (*fn)(), const char *name);
 void * malloc_caps(uint32_t size, uint32_t flags);
 void * malloc_caps_block(uint32_t size, uint32_t flags);
+void amy_oom(const char *fmt, ...);
 void config_reverb(uint8_t bus, float level, float liveness, float damping, float xover_hz);
 void config_chorus(uint8_t bus, float level, uint16_t max_delay, float lfo_freq, float depth);
 void config_echo(uint8_t bus, float level, float delay_ms, float max_delay_ms, float feedback, float filter_coef);
@@ -1196,12 +1204,11 @@ float atoff(const char *s);
 int8_t oscs_init();
 void alloc_osc(int osc, uint8_t *max_num_breakpoints_per_bpset_or_null);
 void free_osc(int osc);
-void ensure_osc_allocd(int osc, uint8_t *max_num_breakpoints_per_bpset_or_null);
+bool ensure_osc_allocd(int osc, uint8_t *max_num_breakpoints_per_bpset_or_null);
 void patches_init(int max_memory_patches);
 void patches_deinit();
 void parse_algo_source(char* message, int16_t *vals);
 void hold_and_modify(uint16_t osc) ;
-void amy_execute_delta();
 void amy_execute_deltas();
 int16_t * amy_fill_buffer();
 int16_t * amy_simple_fill_buffer();  // excute_deltas + render + fill_buffer
@@ -1211,11 +1218,14 @@ uint32_t ms_to_samples(uint32_t ms) ;
 
 // API
 void amy_add_message(char *message);
+// Parse and play a stored wire message now (a fired sequencer entry).
+void amy_play_message(char *message);
 // Like amy_add_message but the data is treated as coming from an external
 // sysex source, so file transfer routing (transfer_flag) applies.
-void amy_add_message_from_sysex(char *message);
+void amy_send_wire_from_sysex(char *message);
 void amy_add_event(amy_event *e);
 size_t yield_event_from_message(char *message, amy_event *e, size_t pos);
+void handle_ticks_message(char *message);
 int amy_parse_message(char * message, amy_event *e);
 void amy_start(amy_config_t);
 void amy_stop();
@@ -1231,11 +1241,23 @@ amy_config_t amy_default_config();
 void amy_clear_event(amy_event *e);
 amy_event amy_default_event();
 uint32_t amy_sysclock();
+uint64_t amy_sysclock64();
+
+// Wrap-relative comparison for the 32-bit millisecond clock. amy_sysclock()
+// rolls over every 2^32 ms (49.7 days), so a plain `now >= then` strands every
+// queued event at the rollover -- and, because the delta queue is time-sorted,
+// misorders a note_off ahead of its own note_on, leaving the note stuck on.
+// Valid as long as the two times are within 2^31 ms (~24.8 days) of each other,
+// which holds for everything AMY schedules.
+#define AMY_TIME_GEQ(a, b)  ((int32_t)((uint32_t)(a) - (uint32_t)(b)) >= 0)
 // CPU overload detection: platform render loops call this once per block.
 void amy_overload_check(uint32_t render_us);
 void amy_overload_failsafe();
 void amy_set_render_load_threshold(float threshold);
 float amy_get_render_load();
+// Runtime allocation failures since amy_start.  AMY degrades on OOM (silent
+// voice, dropped event) instead of crashing; hosts can poll this to detect it.
+uint32_t amy_get_oom_count();
 int amy_get_output_buffer(output_sample_type * samples);
 int amy_get_input_buffer(output_sample_type * samples);
 void amy_set_external_input_buffer(output_sample_type * samples);
@@ -1250,6 +1272,10 @@ void *amy_get_external_hook_context(void);
 void amy_start_web();
 void amy_start_web_no_synths();
 #endif
+
+// Play the startup bleep with raw oscs / the default sinewave synth voice.
+void amy_bleep(uint32_t start);
+void amy_bleep_synth(uint32_t start);
 
 // external functions
 void amy_restart();
@@ -1358,15 +1384,22 @@ extern void patches_load_patch(amy_event *e);
 extern void patches_event_has_voices(amy_event *e, struct delta **queue);
 extern void patches_reset_patch(int patch_number);
 extern void patches_reset();
+extern void snprintfloat3dp(char *s, size_t max_len, float val);
 extern int sprint_event(amy_event *e, char *s, size_t len, bool wirecode);
 extern void fprintf_event_stderr(amy_event *e);
 extern void *yield_synth_events(uint8_t synth, struct amy_event *event, bool include_fx, void *state);
 extern void *yield_synth_commands(uint8_t synth, char *s, size_t len, bool include_fx, void *state);
+extern void *yield_bus_commands(char *s, size_t len, void *state);
+extern void set_event_for_bus_fx(amy_event *event, uint8_t bus, global_state_t *state);
 extern int size_of_amy_event(void);
-extern bool event_is_bus_directed(amy_event *e);
+extern bool event_addresses_bus(amy_event *e);
+extern bool event_addresses_synth(amy_event *e);
+extern bool event_addresses_oscs(amy_event *e);
 
 // osc -> (amy) voice ownership map (patches.c); AMY_UNSET for oscs outside any voice.
-extern uint8_t *osc_to_voice;
+// uint16_t, like every other voice index: a uint8_t here silently truncated
+// voice numbers once max_voices went over 255.
+extern uint16_t *osc_to_voice;
 
 extern struct delta **queue_for_patch_number(int patch_number);
 extern void update_num_oscs_for_patch_number(int patch_number);
@@ -1380,7 +1413,11 @@ extern void instruments_reset();
 extern void instrument_add_new(int instrument_number, int num_voices, uint16_t *amy_voices, uint16_t patch_number, uint16_t oscs_per_voice, uint8_t bus, uint32_t flags);
 extern void instrument_release(int instrument_number);
 extern void instrument_change_number(int old_instrument_number, int new_instrument_number);
-#define _INSTRUMENT_NO_VOICE (255)
+// "no voice" sentinel. Must stay outside the range of a real voice index:
+// the functions below return either this or an amy voice number, and both
+// are uint16_t, so 255 stopped being a safe choice once max_voices could
+// exceed it.
+#define _INSTRUMENT_NO_VOICE (UINT16_MAX)
 extern uint16_t instrument_voice_for_note_event(int instrument_number, int note, bool is_note_off, bool *pstolen);
 extern bool instrument_number_exists(int instrument_number, const char *tag);
 extern int instrument_get_num_voices(int instrument_number, uint16_t *amy_voices);
@@ -1443,6 +1480,12 @@ extern void custom_mod_trigger(uint16_t osc);
 extern int16_t * pcm_load(uint16_t preset_number, uint32_t length, uint32_t samplerate, uint8_t channels, uint8_t midinote, uint32_t loopstart, uint32_t loopend);
 extern const int16_t *pcm_get_sample_ram_for_preset(uint16_t preset_number, uint32_t *length);
 extern int pcm_load_file();
+// Guard against configuring a PCM loop on a file-backed (streamed) preset,
+// which can never loop. Called with the PROPOSED mode and preset as each is
+// set; returns false if that command should be dropped (having warned).
+// mode_is_the_new_part picks which of the two the message blames.
+extern bool pcm_loop_config_allowed(uint16_t osc, uint16_t mode, uint16_t preset_number,
+                                    bool mode_is_the_new_part);
 extern void pcm_unload_preset(uint16_t preset_number);
 extern void pcm_unload_all_presets();
 

@@ -286,6 +286,57 @@ static void fclose_if_file(memorypcm_preset_t *preset) {
     }
 }
 
+static bool mode_is_looping(uint16_t mode) {
+    return mode == PCM_LOOP || mode == PCM_LOOP_STOP || mode == PCM_LOOP_FOREVER;
+}
+
+// True if `preset_number` streams from a file rather than sitting in memory.
+// `filename_out`, when non-NULL, receives the file name for the message.
+static bool preset_is_file(uint16_t preset_number, const char **filename_out) {
+    if (AMY_IS_UNSET(preset_number)) return false;
+    memorypcm_preset_t rom_local;
+    memorypcm_preset_t *preset = get_preset_for_preset_number(preset_number, &rom_local);
+    if (preset == NULL || preset->type != AMY_PCM_TYPE_FILE) return false;
+    if (filename_out != NULL) *filename_out = preset->filename;
+    return true;
+}
+
+// A file-backed preset streams through a small sliding buffer rather than
+// sitting in a table we can index freely, so there is nothing to loop back
+// into: render_pcm refills from the file each block and rewinds phase to the
+// top of the fresh buffer. A PCM_LOOP* mode on such a preset can never do
+// what it says.
+//
+// Rather than accept the command and quietly do something else at note-on,
+// refuse it where it is issued -- when the mode changes, and when the preset
+// number changes -- so the configuration never reaches a state it can't
+// honor, and the user hears about it while the offending command is still in
+// front of them. Called with the *proposed* mode and preset; returns false if
+// the command should be dropped.
+//
+// (Whole-file looping *would* be implementable on top of the fseek+re-parse
+// rewind pcm_note_on already does; what a stream can never honor is the
+// loopstart/loopend marks. That's a bigger change than this one.)
+bool pcm_loop_config_allowed(uint16_t osc, uint16_t mode, uint16_t preset_number,
+                             bool mode_is_the_new_part) {
+    // mode means nothing outside PCM, so don't second-guess other waves.
+    if (synth[osc]->wave != PCM) return true;
+    if (!mode_is_looping(mode)) return true;
+    const char *filename = NULL;
+    if (!preset_is_file(preset_number, &filename)) return true;
+    if (mode_is_the_new_part) {
+        fprintf(stderr, "amy: osc %d preset %d streams from %s, which cannot loop; "
+                        "ignoring mode=%d. Use load_sample() to loop.\n",
+                osc, preset_number, filename ? filename : "a file", mode);
+    } else {
+        fprintf(stderr, "amy: preset %d streams from %s, which cannot loop, but osc %d "
+                        "is in mode=%d; ignoring preset=%d. Set a non-loop mode first, "
+                        "or use load_sample().\n",
+                preset_number, filename ? filename : "a file", osc, mode, preset_number);
+    }
+    return false;
+}
+
 void pcm_note_on(uint16_t osc) {
     if(AMY_IS_SET(synth[osc]->preset)) {
         memorypcm_preset_t rom_local;
@@ -338,10 +389,9 @@ void pcm_note_on(uint16_t osc) {
         } else {
             synth[osc]->phase = 0; // s16.15 index into the table; as if a PHASOR into a 16 bit sample table.
         }
-        // Special case: We use the msynth feedback flag to indicate note-off for looping PCM.  As a result, it's explicitly NOT set in amy:hold_and_modify for PCM voices.  Set it here.
-        msynth[osc]->feedback = synth[osc]->feedback;
-
-        // Make sure PCM waveforms are excluded from auto-termination, so we don't cut-off samples with silent gaps.
+        // Copy the looping mode from the wave mode field.  Can be updated on note_off.
+        msynth[osc]->state = synth[osc]->mode;
+        // Make sure PCM waveforms are excluded from auto-termination, so we don't cut-off samples with silent gaps.  May be modified by note_off.
         synth[osc]->terminate_on_silence = 0;
     }
 }
@@ -353,29 +403,38 @@ void pcm_mod_trigger(uint16_t osc) {
 
 void pcm_note_off(uint16_t osc) {
     if(AMY_IS_SET(synth[osc]->preset)) {
-        // feedback >= 2: "sustain through release" (from Leeman1982/amy) -- the
-        // host has an amp envelope with a meaningful release stage, so don't
-        // stop the sample here: looped presets keep looping, one-shots keep
-        // playing to their natural end, and the EG fades the voice (the osc
-        // stops when the envelope completes). Without this, the release stage
-        // had at most the sample's loop tail (~tens of ms) to act on.
+        // FORK: feedback >= 2 is "sustain through release" (from Leeman1982/amy):
+        // the host's amp EG has a meaningful release stage, so don't stop the
+        // sample here -- looped presets keep looping, one-shots play to their
+        // natural end, and the EG fades the voice out (play_delta note-off starts
+        // the release clock + terminate_on_silence for these). Without this the
+        // release stage had at most the sample's loop tail (~tens of ms) to act on.
         if(msynth[osc]->feedback >= 2) {
             return;
         }
-        uint32_t length = 0;
-        memorypcm_preset_t rom_local;
-        memorypcm_preset_t *preset =
-            get_preset_for_preset_number(synth[osc]->preset, &rom_local);
-        if(preset != NULL) {
-            length = preset->length;
-        }
-        if(msynth[osc]->feedback == 0) {
-            // Non-looping note: Set phase to the end to cause immediate stop.
-            synth[osc]->phase = F2P(length / (float)(1 << PCM_INDEX_BITS));
-        } else {
-            // Looping is requested, disable future looping, sample will play through to end.
+        if (msynth[osc]->state == PCM_PLAY_STOP
+            || msynth[osc]->state == PCM_LOOP_STOP) {
+            // PCM mode where note off causes immediate stop.
+            //
+            // This used to seek phase past the end of the sample and let
+            // render_pcm notice on the next block. That worked only for
+            // in-memory presets: a streamed one refills from the file and
+            // resets phase to 0 every block, so the seek was thrown away and
+            // the clip played on to end-of-file, ignoring note-off entirely.
+            // PCM_PLAY_STOP is the DEFAULT mode, so that hit every
+            // disk_sample() note-off. Stopping the osc says what we mean and
+            // works for both kinds -- and it no longer needs the preset
+            // lookup that the seek needed just to find the sample length.
+            synth[osc]->status = SYNTH_OFF;
+        } else if (msynth[osc]->state == PCM_LOOP_FOREVER) {
+            // Sending one note-off to a LOOP_FOREVER loop downgrades it to a stoppable loop.
+            msynth[osc]->state = PCM_LOOP;
+            // Allow the engine to terminate it when it goes to silence (e.g. from envelope).
+            synth[osc]->terminate_on_silence = 1;
+        } else if (msynth[osc]->state == PCM_LOOP || msynth[osc]->state == PCM_PLAY) {
+            // Looping was enabled but after stop we just play through to the end.
             // (sending a second note-off will stop it immediately).
-            msynth[osc]->feedback = 0;
+            msynth[osc]->state = PCM_PLAY_STOP;
         }
     }
 }
@@ -528,7 +587,10 @@ SAMPLE render_pcm(SAMPLE* buf, uint16_t osc) {
                     sample = 0;
                     if (last_out != 0) { declick += last_out; last_out = 0; }
                 } else {
-                    if(msynth[osc]->feedback > 0) { // still looping.  The feedback flag is cleared by pcm_note_off.
+                    if(msynth[osc]->state == PCM_LOOP
+                       || msynth[osc]->state == PCM_LOOP_STOP
+                       || msynth[osc]->state == PCM_LOOP_FOREVER) {
+                        // still looping.  The state may be modified by pcm_note_off.
                         if(base_index >= preset->loopend) { // loopend
                             // back to loopstart -- but only for a real sustain
                             // loop. One-shot presets have loopend == length;

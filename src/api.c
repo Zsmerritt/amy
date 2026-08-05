@@ -24,6 +24,7 @@ amy_config_t amy_default_config() {
     c.amy_external_coef_hook = NULL;
     c.amy_external_block_done_hook = NULL;
     c.amy_external_midi_input_hook = NULL;
+    c.amy_external_midi_output_hook = NULL;
     c.amy_external_sequencer_hook = NULL;
     c.amy_external_fopen_hook = NULL;
     c.amy_external_fwrite_hook = NULL;
@@ -31,7 +32,7 @@ amy_config_t amy_default_config() {
     c.amy_external_fseek_hook = NULL;
     c.amy_external_fclose_hook = NULL;
     c.amy_external_file_transfer_done_hook = NULL;
-    c.amy_external_update_file_hook = NULL;
+    c.amy_external_update_file_hook = NULL;  // FORK: zA support (upstream removed in 5bd6dfc9)
     c.amy_external_exec_hook = NULL;
     c.amy_external_reboot_hook = NULL;
     c.amy_external_overload_hook = NULL;
@@ -117,12 +118,12 @@ amy_event amy_default_event() {
 }
 
 void amy_clear_event(amy_event *e) {
-    e->status = EVENT_EMPTY;
     AMY_UNSET(e->time);
     AMY_UNSET(e->osc);
     AMY_UNSET(e->bus);
     AMY_UNSET(e->preset);
     AMY_UNSET(e->wave);
+    AMY_UNSET(e->mode);
     AMY_UNSET(e->patch_number);
     AMY_UNSET(e->trigger_phase);
     AMY_UNSET(e->feedback);
@@ -159,9 +160,6 @@ void amy_clear_event(amy_event *e) {
     for (int i = 0; i < MAX_ALGO_OPS; ++i) {
         AMY_UNSET(e->algo_source[i]);
     }
-    for (int i = 0; i < MAX_VOICES_PER_INSTRUMENT; ++i) {
-        AMY_UNSET(e->voices[i]);
-    }
     for (int i = 0; i < MAX_BPS; ++i) {
         AMY_UNSET(e->eg0_times[i]);
         AMY_UNSET(e->eg0_values[i]);
@@ -178,9 +176,9 @@ void amy_clear_event(amy_event *e) {
     AMY_UNSET(e->mpe_members);
     AMY_UNSET(e->mpe_bend_range);
     AMY_UNSET(e->num_voices);
-    AMY_UNSET(e->sequence[SEQUENCE_TICK]);
-    AMY_UNSET(e->sequence[SEQUENCE_PERIOD]);
-    AMY_UNSET(e->sequence[SEQUENCE_TAG]);
+    AMY_UNSET(e->ticks[TICKS_TICK]);
+    AMY_UNSET(e->ticks[TICKS_PERIOD]);
+    AMY_UNSET(e->ticks[TICKS_TAG]);
     AMY_UNSET(e->eq_l);
     AMY_UNSET(e->eq_m);
     AMY_UNSET(e->eq_h);
@@ -242,42 +240,71 @@ output_sample_type * amy_simple_fill_buffer() {
 }
 
 
-// on all platforms, sysclock is based on total samples played, using audio out (i2s or etc) as system clock
-uint32_t amy_sysclock() {
-    // Time is returned in integer milliseconds; wraps at 2^32 ms = 49.7 days.
+// on all platforms, sysclock is based on total samples played, using audio out
+// (i2s or etc) as system clock 64-bit milliseconds since start. total_blocks is
+// u32 and increments once per AMY_BLOCK_SIZE samples, so this does not wrap for
+// ~219 years at 44.1 kHz.  Anything that stores an absolute deadline and
+// compares it later must use this rather than amy_sysclock(); see
+// sequencer_check_and_fill().
+uint64_t amy_sysclock64() {
     // Integer math: computing this through float quantizes the clock once
     // total samples exceed the 24-bit mantissa (~6 min at 48 kHz), and the
     // u32 samples-domain multiply wrapped after 2^32 samples (~25 h).
-    return (uint32_t)(((uint64_t)amy_global.total_blocks * (AMY_BLOCK_SIZE * 1000u)) / AMY_SAMPLE_RATE);
+    return ((uint64_t)amy_global.total_blocks * (AMY_BLOCK_SIZE * 1000u)) / AMY_SAMPLE_RATE;
+}
+
+uint32_t amy_sysclock() {
+    // Time is returned in integer milliseconds; wraps at 2^32 ms = 49.7 days.
+    // This is the wire/event-facing clock and stays 32-bit for compatibility.
+    // Consumers compare event times wrap-relative (AMY_TIME_GEQ), so the
+    // rollover is handled rather than avoided.
+    return (uint32_t)amy_sysclock64();
 }
 
 
-// Flag indicating whether the current amy_add_message call is from an
-// external sysex source (in which case transfer_flag should route data
-// to parse_transfer_message) or from an internal amy.send() call (in
-// which case it should be processed as a normal wire command).
-// Without this, a sketch's amy.send(note=36) during a file transfer
-// would get base64-decoded and written to the file as garbage.
-bool amy_parsing_from_sysex = false;
-
-// given a wire message string play / schedule the event directly (WIRE API)
-void amy_add_message(char *message) {
-    peek_stack("add_message");
+// Parse and play a stored (fired sequencer) wire message now.
+void amy_play_message(char *message) {
+    peek_stack("play_message");
     amy_event e;
     size_t pos = 0;
     do {
         amy_clear_event(&e);
         pos = yield_event_from_message(message, &e, pos);
-        if (pos > 0)  amy_add_event(&e);
+        if (pos > 0) amy_add_event(&e);
     } while(pos > 0);
 }
 
+// given a wire message string play / schedule the event directly (WIRE API)
+void amy_add_message_with_sysex_flag(char *message, bool sysex) {
+    peek_stack("add_message");
+    if (sysex
+        && (amy_global.transfer_flag == AMY_TRANSFER_TYPE_FILE
+            || amy_global.transfer_flag == AMY_TRANSFER_TYPE_AUDIO)) {
+        // Transfer status can't change mid-message, so the whole string is
+        // one chunk of transfer payload.
+        parse_transfer_message(message, (uint16_t)strlen(message));
+        return;
+    }
+    // Fast pre-check of this message for a leading 'H' (ticks) scheduling
+    // command, only recognized as the very first character of the message.
+    if (message[0] == 'H') {
+        handle_ticks_message(message);
+    } else {
+        // Not scheduled: parse and play every command in the message now.
+        amy_play_message(message);
+    }
+}
+
+// given a wire message string play / schedule the event directly (WIRE API)
+void amy_add_message(char *message) {
+    amy_add_message_with_sysex_flag(message, /* sysex */ false);
+}
+
 // Like amy_add_message but marks the message as coming from an external
-// sysex source so the file transfer routing in amy_parse_message applies.
-void amy_add_message_from_sysex(char *message) {
-    amy_parsing_from_sysex = true;
-    amy_add_message(message);
-    amy_parsing_from_sysex = false;
+// sysex source so the transfer routing in amy_message_is_transfer_chunk()
+// applies.
+void amy_send_wire_from_sysex(char *message) {
+    amy_add_message_with_sysex_flag(message, /* sysex */ true);
 }
 
 // given an event play / schedule the event directly (C API)
@@ -285,24 +312,33 @@ void amy_add_message_from_sysex(char *message) {
 void amy_add_event(amy_event *e) {
     peek_stack("add_event");
     // was amy_process_event
-    if(AMY_IS_SET(e->sequence[SEQUENCE_TICK]) || AMY_IS_SET(e->sequence[SEQUENCE_PERIOD]) || AMY_IS_SET(e->sequence[SEQUENCE_TAG])) {
-        uint8_t added = sequencer_add_event(e);
-        (void)added; // we don't need to do anything with this info at this time
-        e->status = EVENT_SEQUENCE;
+    if(AMY_IS_SET(e->ticks[TICKS_TICK]) || AMY_IS_SET(e->ticks[TICKS_PERIOD]) || AMY_IS_SET(e->ticks[TICKS_TAG])) {
+        // C-API ticks event: serialize it to a wire message and hand it to
+        // the sequencer, so scheduled events have a single storage format.
+        char *buf = (char *)malloc_caps(MAX_MESSAGE_LEN, amy_global.config.ram_caps_events);
+        if (buf == NULL) {
+            amy_oom("add_event ticks");
+            return;
+        }
+        sprint_event(e, buf, MAX_MESSAGE_LEN, /* wirecode */ true);
+        amy_add_message(buf);
+        free(buf);
     } else if (AMY_IS_SET(e->reset_osc) && (e->reset_osc & RESET_PATCH) && AMY_IS_SET(e->patch_number)) {
         // We're resetting just one patch, do it now.  But RESET_PATCH with no patch_number should propagate to deltas.
         patches_reset_patch(e->patch_number);
         AMY_UNSET(e->reset_osc);
     } else {
-        // if time is set, play then
-        // if time and latency is set, play in time + latency
-        // if time is not set, play now
-        // if time is not set + latency is set, play in latency
+        // e->time (if set) plus latency gives this delta's playback time --
+        // for near-term ordering (e.g. noteon_delay) and output-latency
+        // compensation, not for long-horizon scheduling; use ticks= for that.
         uint32_t playback_time = amy_sysclock();
         if(AMY_IS_SET(e->time)) playback_time = e->time;
         playback_time += amy_global.latency_ms;
+        // UINT32_MAX is the "unset" sentinel for a u32 field, and the clock does
+        // land on it for one millisecond every 49.7 days. Nudge by 1ms so the
+        // event doesn't read back as having no time at all.
+        if(AMY_IS_UNSET(playback_time)) playback_time++;
         e->time = playback_time;
-        e->status = EVENT_SCHEDULED;
         amy_event_to_deltas_queue(e, 0, &amy_global.delta_queue);
     }
 }
@@ -357,13 +393,14 @@ void amy_default_synths() {
     // GM drum synth on channel 10
     e = amy_default_event();
     e.synth = AMY_MIDI_CHANNEL_DRUMS;  // 10
-    e.num_voices = 1;      // Drums synth has a single voice acting as a dumb container with one osc devoted to each drum sound.
 #ifdef GAMMA9001
     e.patch_number = 384;  // Gamma9001 drum kit 0 (baked TR-808 bank); kits 1+ at 385+ via PC bank MSB 3
 #else
     e.patch_number = 258;  // Set up in headers.py to use midi_note_cmd to match some midi note events to PCM samples
 #endif
-    e.synth_flags = SYNTH_FLAGS_NOTES_VIA_MIDI | SYNTH_FLAGS_IGNORE_NOTE_OFFS;  // Ensure note events go via midi_note_cmd
+    //e.synth_flags = SYNTH_FLAGS_NOTES_VIA_MIDI | SYNTH_FLAGS_IGNORE_NOTE_OFFS;  // Ensure note events go via midi_note_cmd
+    //e.num_voices = 1;      // Drums synth has a single voice acting as a dumb container with one osc devoted to each drum sound.
+    // synth flags and num voices are handled in the patch
     amy_add_event(&e);
 
     // DX7 6 note poly on channel 2
